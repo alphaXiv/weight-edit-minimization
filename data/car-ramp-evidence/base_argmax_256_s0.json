@@ -1,0 +1,11 @@
+{
+  "episodes": 256,
+  "success": 0.0,
+  "red": 0.0,
+  "timeout": 1.0,
+  "mean_len": 256.0,
+  "success_count": 0,
+  "seed": 0,
+  "argmax": true,
+  "wall_s": 82.17326474189758
+}

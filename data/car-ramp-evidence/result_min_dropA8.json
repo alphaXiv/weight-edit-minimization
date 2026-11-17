@@ -1,0 +1,12 @@
+{
+  "episodes": 256,
+  "success": 0.0,
+  "red": 1.0,
+  "timeout": 0.0,
+  "mean_len": 69.01171875,
+  "success_count": 0,
+  "seed": 0,
+  "argmax": false,
+  "tag": "min_dropA8",
+  "kept": 1309
+}

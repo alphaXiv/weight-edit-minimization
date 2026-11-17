@@ -1,0 +1,1 @@
+# Bundled so the notebook ignores the viewer's own matplotlibrc; the style is set by orx_figstyle.use_style().

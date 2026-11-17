@@ -1,0 +1,21 @@
+WARNING:absl:Grain multiprocess worker profiling requires jaxlib extension version 448 or later (jaxlib >= 0.11.0). Current version: 397.
+CONFIG {"label": "H_C2", "orx_run_id": "31932c35-8a66-4205-8d17-d665c5bb6aba", "orx_commit": "8a47674bc39e854d0afba50626354c9f81052299", "orx_experiment": "h-c2-14-entry-from-scratch-design-scores-1024-10", "kinematics": "l/h2_car_ramp symbolic_flat multi_discrete frame_skip=2 dense_reward_scale=0.2 auto_reset=false", "max_steps": 256}
+RESULT {"label": "H_C2", "tag": "c2-s0", "weights": "weights/c2_14entry.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 73.0, "mean_return": 1.3754931688308716, "done_frac": 1.0, "wall_s": 36.76438021659851}
+RESULT {"label": "H_C2", "tag": "c2-s1", "weights": "weights/c2_14entry.npz", "format": "actor", "episodes": 1024, "seed": 1, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 73.0, "mean_return": 1.3754931688308716, "done_frac": 1.0, "wall_s": 0.0005869865417480469}
+E1112 19:38:42.251503   51202 slow_operation_alarm.cc:73] Constant folding an instruction is taking > 1s:
+
+  %reduce_max.196 = f32[1024,60]{1,0} reduce(%constant.4089, %constant.3443), dimensions={2}, to_apply=%region_24.50, metadata={op_name="jit(rollout)/while/body/closed_call/vmap(jit(step))/jit(engine_step)/while/body/closed_call/vmap()/reduce_max" stack_frame_id=406}
+
+This isn't necessarily a bug; constant-folding is inherently a trade-off between compilation time and speed at runtime. XLA has some guards that attempt to keep constant folding from taking too long, but fundamentally you'll always be able to come up with an input program that takes a long time.
+
+If you'd like to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+E1112 19:38:42.280788   51092 slow_operation_alarm.cc:140] The operation took 2.168623083s
+Constant folding an instruction is taking > 1s:
+
+  %reduce_max.196 = f32[1024,60]{1,0} reduce(%constant.4089, %constant.3443), dimensions={2}, to_apply=%region_24.50, metadata={op_name="jit(rollout)/while/body/closed_call/vmap(jit(step))/jit(engine_step)/while/body/closed_call/vmap()/reduce_max" stack_frame_id=406}
+
+This isn't necessarily a bug; constant-folding is inherently a trade-off between compilation time and speed at runtime. XLA has some guards that attempt to keep constant folding from taking too long, but fundamentally you'll always be able to come up with an input program that takes a long time.
+
+If you'd like to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+RESULT {"label": "H_C2", "tag": "c2-argmax-s0", "weights": "weights/c2_14entry.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": true, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 73.0, "mean_return": 1.3754931688308716, "done_frac": 1.0, "wall_s": 28.538472175598145}
+SUMMARY {"label": "H_C2", "n_evals": 3, "results": [{"label": "H_C2", "tag": "c2-s0", "weights": "weights/c2_14entry.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 73.0, "mean_return": 1.3754931688308716, "done_frac": 1.0, "wall_s": 36.76438021659851}, {"label": "H_C2", "tag": "c2-s1", "weights": "weights/c2_14entry.npz", "format": "actor", "episodes": 1024, "seed": 1, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 73.0, "mean_return": 1.3754931688308716, "done_frac": 1.0, "wall_s": 0.0005869865417480469}, {"label": "H_C2", "tag": "c2-argmax-s0", "weights": "weights/c2_14entry.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": true, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 73.0, "mean_return": 1.3754931688308716, "done_frac": 1.0, "wall_s": 28.538472175598145}]}

@@ -1,0 +1,12 @@
+{
+  "episodes": 256,
+  "success": 1.0,
+  "red": 0.0,
+  "timeout": 0.0,
+  "mean_len": 73.0,
+  "success_count": 256,
+  "seed": 0,
+  "argmax": false,
+  "tag": "revert_O_actor2_cols",
+  "kept": 5825
+}

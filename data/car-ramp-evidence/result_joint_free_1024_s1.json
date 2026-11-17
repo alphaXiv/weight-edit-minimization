@@ -1,0 +1,12 @@
+{
+  "episodes": 1024,
+  "success": 1.0,
+  "red": 0.0,
+  "timeout": 0.0,
+  "mean_len": 72.0,
+  "success_count": 1024,
+  "seed": 1,
+  "argmax": false,
+  "tag": "joint_free_1024_s1",
+  "kept": 1939
+}

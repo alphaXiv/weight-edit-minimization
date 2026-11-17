@@ -1,0 +1,21 @@
+WARNING:absl:Grain multiprocess worker profiling requires jaxlib extension version 448 or later (jaxlib >= 0.11.0). Current version: 397.
+CONFIG {"label": "H_waypoint_1718", "orx_run_id": "371a4351-ce2b-4271-b7f1-8cebfc04b99e", "orx_commit": "9a676c4b4201d4956c21dfa81dcb7876aa515273", "orx_experiment": "h-waypoint-1718-1718-entry-greedy-waypoint-score", "kinematics": "l/h2_car_ramp symbolic_flat multi_discrete frame_skip=2 dense_reward_scale=0.2 auto_reset=false", "max_steps": 256}
+RESULT {"label": "H_waypoint_1718", "tag": "waypoint1718-s0", "weights": "weights/greedy_waypoint_1718.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 70.0, "mean_return": 1.374327301979065, "done_frac": 1.0, "wall_s": 37.27340483665466}
+RESULT {"label": "H_waypoint_1718", "tag": "waypoint1718-s1", "weights": "weights/greedy_waypoint_1718.npz", "format": "actor", "episodes": 1024, "seed": 1, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 70.0, "mean_return": 1.374327301979065, "done_frac": 1.0, "wall_s": 0.0012691020965576172}
+E1112 19:38:42.238442   51154 slow_operation_alarm.cc:73] Constant folding an instruction is taking > 1s:
+
+  %reduce_max.197 = f32[1024,60]{1,0} reduce(%constant.4116, %constant.3443), dimensions={2}, to_apply=%region_18.44, metadata={op_name="jit(rollout)/while/body/closed_call/vmap(jit(step))/jit(engine_step)/while/body/closed_call/vmap()/reduce_max" stack_frame_id=406}
+
+This isn't necessarily a bug; constant-folding is inherently a trade-off between compilation time and speed at runtime. XLA has some guards that attempt to keep constant folding from taking too long, but fundamentally you'll always be able to come up with an input program that takes a long time.
+
+If you'd like to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+E1112 19:38:42.313677   51045 slow_operation_alarm.cc:140] The operation took 2.066515847s
+Constant folding an instruction is taking > 1s:
+
+  %reduce_max.197 = f32[1024,60]{1,0} reduce(%constant.4116, %constant.3443), dimensions={2}, to_apply=%region_18.44, metadata={op_name="jit(rollout)/while/body/closed_call/vmap(jit(step))/jit(engine_step)/while/body/closed_call/vmap()/reduce_max" stack_frame_id=406}
+
+This isn't necessarily a bug; constant-folding is inherently a trade-off between compilation time and speed at runtime. XLA has some guards that attempt to keep constant folding from taking too long, but fundamentally you'll always be able to come up with an input program that takes a long time.
+
+If you'd like to file a bug, run with envvar XLA_FLAGS=--xla_dump_to=/tmp/foo and attach the results.
+RESULT {"label": "H_waypoint_1718", "tag": "waypoint1718-argmax-s0", "weights": "weights/greedy_waypoint_1718.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": true, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 70.0, "mean_return": 1.374327301979065, "done_frac": 1.0, "wall_s": 27.87120819091797}
+SUMMARY {"label": "H_waypoint_1718", "n_evals": 3, "results": [{"label": "H_waypoint_1718", "tag": "waypoint1718-s0", "weights": "weights/greedy_waypoint_1718.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 70.0, "mean_return": 1.374327301979065, "done_frac": 1.0, "wall_s": 37.27340483665466}, {"label": "H_waypoint_1718", "tag": "waypoint1718-s1", "weights": "weights/greedy_waypoint_1718.npz", "format": "actor", "episodes": 1024, "seed": 1, "argmax": false, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 70.0, "mean_return": 1.374327301979065, "done_frac": 1.0, "wall_s": 0.0012691020965576172}, {"label": "H_waypoint_1718", "tag": "waypoint1718-argmax-s0", "weights": "weights/greedy_waypoint_1718.npz", "format": "actor", "episodes": 1024, "seed": 0, "argmax": true, "success": 1.0, "success_count": 1024, "red": 0.0, "timeout": 0.0, "mean_len": 70.0, "mean_return": 1.374327301979065, "done_frac": 1.0, "wall_s": 27.87120819091797}]}

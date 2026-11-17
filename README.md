@@ -23,30 +23,31 @@ uvx marimo edit --sandbox weight-edit-minimization.py
 
 `--sandbox` installs the dependencies listed at the top of the notebook (Python 3.11, Kinetix 3.0.2,
 JAX 0.9.0 CPU, torch, transformers) into an isolated environment, so nothing on your machine is used
-except `uv`. The first launch takes about a minute. marimo opens notebooks without running them:
-press **Run all** (▷, bottom right) once, about 30 s.
+except `uv`. The first launch takes about a minute.
 
-Everything the notebook reads is in this repo (when only the notebook file is present, as on molab, it downloads the repo once), except Qwen3.5-0.8B, which §2.6 downloads from Hugging Face
-when you press its button.
+## How it works
 
-Without the expensive runs, every section shows the recorded results: the orx run logs for the car-ramp, the raw
-screening outputs for Exp 8, and one bundled example of §2.6's generations. The run buttons re-run them on your
-machine next to the recorded numbers.
+The notebook is the experiment. marimo opens it without running anything; press **Run all** (▷, bottom right)
+and it runs top to bottom, about 5 minutes on a laptop. Each experiment is a short code cell, and the chart under
+it fills in as runs finish, next to the result the original orx run recorded. Change a variable and rerun a cell
+to try your own version: `EPISODES`, `TRACE_NETWORK`, `my_edit`, `my_spec`, `RUN_QWEN`, `CHECKPOINT`.
 
-`weight-edit-minimization.html` is a static export of the notebook after **Run all**, for reading without
-Python. It loads marimo's page code from a CDN, so it needs an internet connection.
-
-## What re-runs
-
-| section | what it does | verified against the orx runs |
+| section | what you run | checked against |
 |---|---|---|
-| §1.1 | rebuilds all 8 car-ramp networks from their edit recipes | bit-identical to every shipped checkpoint |
-| §1.3–1.6 | the exact `eval_actor.py` harness: one evaluation, the whole ladder, the drop-one audit, the embed-restore ablation | same success counts, mean lengths and returns as the recorded runs (same seeds, same key schedule) |
-| §1.7–1.8 | step-by-step mechanism traces; write and evaluate your own edit | — |
-| §2.1–2.3 | applies Astra's bf16 edit, recovers its rank-1 closed form, rebuilds and regenerates all campaign candidates | entry counts and specs match the campaign's |
-| §2.4 | paired statistics from the 29 raw per-problem screening outputs | reproduces the campaign's results table |
-| §2.6 | paired base-vs-candidate Qwen generations on your machine (Apple GPU or CUDA) with a short token budget | — |
-| §2.7 | writes any candidate as a checkpoint; `code/eval_vllm.py` runs the full 32k-token screening on a CUDA GPU | — |
+| §1.2–1.3 | the base actor and Astra's 6,073-entry edit, with animations of each episode | recorded orx runs |
+| §1.4 | the ladder: 6,073 → 1,939 → 1,718 → 12 → 11 entries, and 14 → 10 written from scratch | rebuilt networks are bit-identical to the shipped checkpoints |
+| §1.5–1.6 | drop each of the 12 entries; undo each embed column's erasures | identical success counts and episode lengths to the recorded runs at 256 episodes |
+| §1.7–1.8 | trace the units the edit wires together; write and evaluate your own edit | — |
+| §2.1–2.2 | apply Astra's bf16 Qwen edit, recover its rank-1 form, rebuild the 27 campaign candidates | entry counts and specs match the campaign's |
+| §2.3–2.4 | design a candidate; analyze the 29 raw screens (paired tests, interactive chart, per-problem grid) | the campaign's results table |
+| §2.5 | Qwen generations on your machine, base vs a candidate (`RUN_QWEN = True`; Apple GPU or CUDA) | a bundled example run until you do |
+| §2.6 | write a candidate as a checkpoint for `code/eval_vllm.py`, the campaign's 32k-token screen (CUDA) | — |
+
+Everything the notebook reads is in this repo (when only the notebook file is present, as on molab, it downloads
+the repo once), except Qwen3.5-0.8B, which §2.5 and §2.6 download from Hugging Face when you turn them on.
+
+`weight-edit-minimization.html` is a static export of a full run, for reading without Python. It loads marimo's
+page code from a CDN, so it needs an internet connection.
 
 ## Layout
 
@@ -61,7 +62,7 @@ data/exp8/                    base down_proj tensors, Astra's edit (edit.npz), f
 data/screens/                 per-problem screening outputs, one file per candidate
 data/docs/                    the original write-ups
 figs/                         figure style, and a matplotlibrc that keeps your own matplotlib config out
-runs/, checkpoints/           created when you run §2.6 / §2.7
+runs/, checkpoints/           created by §2.5 / §2.6
 ```
 
 Exp 8 numbers are screening-grade: 256 MATH-train problems, one sample each. Differences under

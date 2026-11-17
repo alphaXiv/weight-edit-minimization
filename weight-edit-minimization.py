@@ -11,6 +11,10 @@
 #     "huggingface_hub",
 #     "math-verify",
 #     "certifi",
+#     "altair",
+#     "pandas",
+#     "imageio",
+#     "pillow",
 # ]
 # ///
 
@@ -23,7 +27,26 @@ app = marimo.App(
 )
 
 
-@app.cell
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Weight-edit minimization — run the experiments yourself
+
+    Two campaigns asked the same question: **what is the smallest set of weights whose edit produces a behavior?**
+    Both start from an edit written by Astra (`RikiyaT/lm_understand-logs`) and strip it down.
+
+    This notebook is the experiment, not a report about it. Run the cells top to bottom (▷ **Run all**, bottom
+    right). Each experiment is a short code cell, and the charts under it fill in as runs finish, next to the
+    numbers the original orx runs recorded. Change a variable and rerun to try your own version. Collapsed cells hold
+    plumbing (setup, the Kinetix harness, chart helpers); click one to read it.
+
+    **Time.** Section 1 runs about 20 evaluations of 256 episodes each on the CPU: ~5 minutes on a laptop. Section 2's
+    analysis is instant; running Qwen yourself (§2.5) is off until you set `RUN_QWEN = True`.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
 def _():
     import json
     import math
@@ -32,7 +55,11 @@ def _():
     import time
     from pathlib import Path
 
+    import altair as alt
     import marimo as mo
+    import pandas as pd
+
+    alt.data_transformers.disable_max_rows()  # the neuron chart plots all 7,168 neurons
 
     REPO = "alphaXiv/weight-edit-minimization"
 
@@ -84,198 +111,75 @@ def _():
     # the house style is sized for print columns; notebook figures need larger text
     plt.rcParams.update({"figure.dpi": 110, "font.size": 10, "axes.labelsize": 10, "axes.titlesize": 10,
                          "xtick.labelsize": 9, "ytick.labelsize": 9, "legend.fontsize": 9})
-    PALETTE, GREY = house.PALETTE, house.BASELINE
-    return CR, EX, GREY, PALETTE, ROOT, json, math, mo, np, plt, time
+    PALETTE = house.PALETTE
+    return CR, EX, PALETTE, ROOT, alt, json, math, mo, np, pd, plt, time
 
 
-@app.cell
-def _(mo):
-    mo.md(r"""
-    # Weight-edit minimization — replication notebook
-
-    Two campaigns, one question: **what is the smallest set of weights whose edit produces the behavior?**
-    Both start from an edit written by Astra (`RikiyaT/lm_understand-logs`) and strip it down.
-
-    Every number below is **recomputed in this notebook** from the checkpoints, edit files and raw
-    per-problem outputs in `data/` — and the expensive parts (Kinetix rollouts, Qwen generations) have
-    **run buttons** so you can re-run the experiments, not just read about them. Until you press one, its section
-    shows the recorded result from the original runs.
-
-    | section | what you can run here | cost on a laptop |
-    |:--|:--|:--|
-    | §1.1 car-ramp networks | rebuild all 8 networks from their edit recipes, bit-check against the shipped checkpoints | instant |
-    | §1.3 one evaluation | the exact Kinetix harness from the orx runs, any network / seed / episode count | 10–45 s |
-    | §1.4 the ladder | 6,073 → 1,939 → 1,718 → 12 → 11 and 14 → 10, side by side with the recorded runs | ~2 min @ 256 ep |
-    | §1.5 drop-one audit | remove each of the 12 entries in turn | ~2.5 min |
-    | §1.6 embed-restore ablation | un-erase one repurposed embed unit at a time | ~40 s |
-    | §1.7 mechanism trace | per-step car state, gate units and action probabilities for one episode | ~15 s |
-    | §1.8 edit playground | write your own entries, evaluate them | 10–45 s |
-    | §2.1–2.3 Exp 8 edit | apply Astra's bf16 edit, recover its rank-1 formula, regenerate & bit-count all 27 campaign candidates | ~20 s |
-    | §2.4 screening re-analysis | accuracy, cut share, paired McNemar tests and bootstrap CIs from the 29 raw screens | instant |
-    | §2.6 run Qwen on this machine | paired base-vs-candidate generations on screening problems (Apple GPU / CUDA) | minutes |
-    | §2.7 GPU replication | write any candidate as a checkpoint + the exact vLLM screening command | — |
-    """)
-    return
-
-
-@app.cell
+@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
     ---
-    ## 1 · Car-ramp: a PPO actor that never solves the level, fixed by 10–12 weights
+    ## 1 · Car-ramp: a PPO actor that never solves its level, fixed by 10–12 weights
 
-    Kinetix `l/h2_car_ramp`: back the car up, drive into the red wall, fly the ramp, stop in the green box.
-    The PPO actor (1.001 B steps) **never** does it. Astra's hand-written edit changes 6,073 entries and
-    solves it every time. The campaign asked how many of those entries matter.
+    Kinetix `l/h2_car_ramp`: get the car's green wheel over the ramp and into the blue goal without the green wheel
+    touching the red strip. A PPO actor trained for 1.001 B steps never does it. Astra's hand-written edit changes
+    6,073 of its weights and solves it every time. How many of those 6,073 matter?
 
-    **Rounding convention.** Astra saw each tensor rounded to 3 significant digits
-    (`scale = 10**(floor(log10(max|W|)) - 2)`), so every edited network is *rounded base + entries*, and
-    entry counts are against the rounded base.
+    ### 1.1 Settings and the base network
+
+    Every evaluation below uses these settings. The orx runs used 256 episodes for the audits and 1,024 for the
+    headline numbers; sampled episodes use the same key schedule as `eval_actor.py`, so with the same episode count
+    and seed you get exactly the recorded counts.
     """)
     return
 
 
 @app.cell
-def _(CR, json, np):
-    NAME_MAP = {
-        "embed.W": "params/Dense_0/kernel",
-        "embed.b": "params/Dense_0/bias",
-        "actor_head.W": "params/GeneralActorCriticRNN_0/Dense_0/kernel",
-        "actor_head.b": "params/GeneralActorCriticRNN_0/Dense_0/bias",
-    }
+def _():
+    EPISODES = 256  # episodes per evaluation; 1,024 reproduces the headline runs (about 4x slower)
+    SEED = 0
+    return EPISODES, SEED
+
+
+@app.cell
+def _(CR, mo, np):
+    NAME_MAP = {"embed.W": "params/Dense_0/kernel", "embed.b": "params/Dense_0/bias",
+                "actor_head.W": "params/GeneralActorCriticRNN_0/Dense_0/kernel",
+                "actor_head.b": "params/GeneralActorCriticRNN_0/Dense_0/bias"}
     for _i in range(5):
         NAME_MAP[f"actor{_i}.W"] = f"params/GeneralActorCriticRNN_0/DenseAndActivation_{_i}/Dense_0/kernel"
         NAME_MAP[f"actor{_i}.b"] = f"params/GeneralActorCriticRNN_0/DenseAndActivation_{_i}/Dense_0/bias"
 
+    _ckpt = np.load(CR / "base_ppo_final_seed0.npz")
+    base_raw = {k: _ckpt[v].astype(np.float64) for k, v in NAME_MAP.items()}
+
 
     def round3(x):
+        """Astra saw each tensor rounded to 3 significant digits; every edit is made on top of that."""
         scale = 10.0 ** (np.floor(np.log10(np.abs(x).max())) - 2)
         return np.round(x / scale) * scale
 
 
-    _base = np.load(CR / "base_ppo_final_seed0.npz")
-    base_raw = {k: _base[v].astype(np.float64) for k, v in NAME_MAP.items()}
     rounded = {k: round3(v) for k, v in base_raw.items()}
-    _ed = np.load(CR / "edited_actor.npz")
-    astra = {k: _ed[k].astype(np.float64) for k in _ed.files}
+    mo.md(f"{sum(v.size for v in base_raw.values()):,} actor weights in {len(base_raw)} tensors")
+    return NAME_MAP, base_raw, rounded
 
 
-    def apply_entries(entries):
-        """Rounded base + entries. Each entry is (tensor, index, value); value None = Astra's value there."""
-        W = {k: v.copy() for k, v in rounded.items()}
-        for t, idx, val in entries:
-            idx = tuple(idx)
-            W[t][idx] = astra[t][idx] if val is None else val
-        return W
-
-
-    def changed_entries(W):
-        return [(k, tuple(int(i) for i in ix)) for k in rounded for ix in zip(*np.nonzero(W[k] != rounded[k]))]
-
-
-    # --- the recipes ---------------------------------------------------------
-    KEEP_1939 = [(t, tuple(i), None) for t, i in json.load(open(CR / "keep_joint_free.json"))]
-    GREEDY12 = [(t, tuple(i), None) for t, i in json.load(open(CR.parent / "car-ramp-evidence" / "greedy_gf5_final.json"))]
-    GREEDY11 = [e for e in GREEDY12 if (e[0], e[1]) != ("actor1.W", (122, 126))]
-    C2_14 = [(t, tuple(i), float(v)) for t, i, v in json.load(open(CR / "c2_edits.json"))]
-    _C2_DROPPED = {("embed.W", (52, 26)), ("actor0.W", (26, 114)), ("actor0.b", (23,)), ("actor0.b", (114,))}
-    C2_MIN_10 = [e for e in C2_14 if (e[0], e[1]) not in _C2_DROPPED]
-    # the 1,718 waypoint was found by a greedy keep/drop search whose keep-list was not saved; take its
-    # entry set from the shipped checkpoint (every value equals Astra's, checked below)
-    _wp = np.load(CR / "greedy_waypoint_1718.npz")
-    WAYPOINT_1718 = [(t, i, None) for t, i in changed_entries({k: _wp[k].astype(np.float64) for k in _wp.files})]
-
-    networks = {
-        "base PPO": base_raw,
-        "Astra edit": astra,
-        "joint_free": apply_entries(KEEP_1939),
-        "waypoint": apply_entries(WAYPOINT_1718),
-        "greedy-12": apply_entries(GREEDY12),
-        "greedy-11": apply_entries(GREEDY11),
-        "C2, from scratch": apply_entries(C2_14),
-        "C2-min, from scratch": apply_entries(C2_MIN_10),
-    }
-    SHIPPED = {
-        "base PPO": "base_ppo_final_seed0.npz",
-        "Astra edit": "edited_actor.npz",
-        "joint_free": "joint_free.npz",
-        "waypoint": "greedy_waypoint_1718.npz",
-        "greedy-12": "greedy12_astra.npz",
-        "greedy-11": "greedy11_drop02.npz",
-        "C2, from scratch": "c2_14entry.npz",
-        "C2-min, from scratch": "c2_min_10entry.npz",
-    }
-    return (
-        C2_MIN_10,
-        GREEDY12,
-        KEEP_1939,
-        NAME_MAP,
-        SHIPPED,
-        apply_entries,
-        astra,
-        changed_entries,
-        networks,
-        rounded,
-    )
-
-
-@app.cell
-def _(
-    C2_MIN_10,
-    CR,
-    GREEDY12,
-    NAME_MAP,
-    SHIPPED,
-    astra,
-    changed_entries,
-    mo,
-    networks,
-    np,
-    rounded,
-):
-    _rows = []
-    for _name, _W in networks.items():
-        _z = np.load(CR / SHIPPED[_name])
-        _ship = {k: _z[NAME_MAP[k] if _name == "base PPO" else k].astype(np.float64) for k in rounded}
-        _same = all(np.array_equal(_W[k], _ship[k]) for k in rounded)
-        _n = 0 if _name == "base PPO" else len(changed_entries(_W))
-        _rows.append({"network": _name, "entries vs rounded base": f"{_n:,}",
-                      "rebuilt == shipped checkpoint": "✅ bit-identical" if _same else "❌ differs",
-                      "file": SHIPPED[_name]})
-    _wp_astra = all(networks["waypoint"][t][i] == astra[t][i] for t, i in changed_entries(networks["waypoint"]))
-
-    def _fmt(entries):
-        return "<br>".join(f"`{t}[{','.join(map(str, i))}]` = {astra[t][i] if v is None else v:g}" for t, i, v in entries)
-
-    mo.vstack([
-        mo.md("### 1.1 Build every network from its recipe\n\nRecipes live in the cell above (`KEEP_1939`, `GREEDY12`, `C2_14`, …). Each is rebuilt from the base checkpoint and compared bit-for-bit with the network the orx runs evaluated:"),
-        mo.ui.table(_rows, selection=None, pagination=False),
-        mo.md(f"{'✅' if _wp_astra else '❌'} Every one of the waypoint's 1,718 values is Astra's edited value."),
-        mo.hstack([
-            mo.md("**greedy-12** (a subset of Astra's own edit)<br>" + _fmt(GREEDY12)),
-            mo.md("**C2-min-10** (written from scratch, zero erasures)<br>" + _fmt(C2_MIN_10)),
-        ], widths="equal"),
-    ])
-    return
-
-
-@app.cell
+@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ### 1.2 The evaluation harness
-
-    This is `tools/eval_actor.py` from the orx experiment branches (`code/car_ramp_eval_actor.py`), the
-    fixed run command of every car-ramp node: official Kinetix (`kinetix-env==3.0.2`, JAX CPU),
-    `symbolic_flat` observations (679-d), `multi_discrete` actions (entry 0 drives the motor), frame-skip 2,
-    256 steps, outcome read at the **first** done step from `info["GoalR"]`. `trace_episode` is the same
-    rollout for a single episode, also recording the car state and every hidden unit.
+    The actor is a ReLU embedding (679 observations → 128 units), five tanh layers of 128, and a head of 16 action
+    logits (only the first 3 drive the motor). The cell below (collapsed) is the evaluation harness: the exact
+    `tools/eval_actor.py` the orx runs used, on official Kinetix (`kinetix-env==3.0.2`, JAX on CPU). It gives you
+    `evaluate(weights, episodes, seed)`, `trace_episode(weights)` for one recorded episode, and `animate(...)`.
     """)
     return
 
 
-@app.cell
-def _(np, time):
+@app.cell(hide_code=True)
+def _(mo, np, time):
     import functools
+    import hashlib
     import logging as _logging
 
     _logging.getLogger("absl").setLevel(_logging.ERROR)  # Kinetix's grain import warns about profiling support
@@ -337,14 +241,20 @@ def _(np, time):
                 "mean_len": (first + 1).mean(), "mean_return": jnp.cumsum(rewards, 0)[first, ar].mean()}
 
 
+    _cache = {}
+
+
     def evaluate(W, episodes=256, seed=0, argmax=False):
-        """One evaluation, as `eval_actor.py` runs it. W: tensor name -> array."""
-        Wj = {k: jnp.asarray(v, jnp.float32) for k, v in W.items()}
-        t0 = time.perf_counter()
-        out = {k: float(v) for k, v in _rollout(Wj, jax.random.PRNGKey(seed), episodes, argmax).items()}
-        out.update(episodes=episodes, seed=seed, argmax=argmax, success_count=int(out["success_count"]),
-                   wall_s=round(time.perf_counter() - t0, 1))
-        return out
+        """Run `episodes` episodes of the car-ramp level with actor weights W (tensor name -> array)."""
+        key = (hashlib.sha1(b"".join(np.ascontiguousarray(W[k], np.float32).tobytes() for k in sorted(W))).hexdigest(), episodes, seed, argmax)
+        if key not in _cache:  # the same network shows up in several experiments; run it once
+            Wj = {k: jnp.asarray(v, jnp.float32) for k, v in W.items()}
+            t0 = time.perf_counter()
+            out = {k: float(v) for k, v in _rollout(Wj, jax.random.PRNGKey(seed), episodes, argmax).items()}
+            out.update(episodes=episodes, seed=seed, argmax=argmax, success_count=int(out["success_count"]),
+                       wall_s=round(time.perf_counter() - t0, 1))
+            _cache[key] = out
+        return _cache[key]
 
 
     @jax.jit
@@ -356,7 +266,8 @@ def _(np, time):
             obs, state, done, rng = carry
             logits, h = actor_forward(W, obs.astype(jnp.float32))
             action, rng = _act(logits, rng, True)
-            rec = (obs[0, jnp.array([OBS_X, OBS_VX, OBS_GX])], jnp.stack(h)[:, 0], jax.nn.softmax(logits[0, :3]), action[0, 0], done[0])
+            rec = (obs[0, jnp.array([OBS_X, OBS_VX, OBS_GX])], jnp.stack(h)[:, 0], jax.nn.softmax(logits[0, :3]), action[0, 0], done[0],
+                   jax.tree.map(lambda x: x[0], state))
             obs, state, _, new_done, info = jax.vmap(_env.step, in_axes=(0, 0, 0, None, None))(
                 jax.random.split(rng, 1), state, action, _env_params, None)
             return (obs, state, done | new_done, rng), rec + (info["GoalR"][0],)
@@ -366,342 +277,431 @@ def _(np, time):
 
 
     def trace_episode(W, seed=0):
-        """Argmax episode: car state (x, vx, green-x), hidden activations [layer, unit], p(action 0..2), outcome."""
-        obs, h, probs, action, done, goal = (np.asarray(a) for a in _trace({k: jnp.asarray(v, jnp.float32) for k, v in W.items()}, jax.random.PRNGKey(seed)))
+        """One argmax episode: car state (x, vx, green-x), every hidden activation, p(motor action), env states, outcome."""
+        *_arrays, states, goal = _trace({k: jnp.asarray(v, jnp.float32) for k, v in W.items()}, jax.random.PRNGKey(seed))
+        obs, h, probs, action, done = (np.asarray(a) for a in _arrays)
+        goal = np.asarray(goal)
         n = int(np.argmax(done)) if done.any() else 256
-        return {"obs": obs[:n], "h": h[:n], "probs": probs[:n], "action": action[:n], "steps": n,
+        return {"obs": obs[:n], "h": h[:n], "probs": probs[:n], "action": action[:n], "steps": n, "states": states,
                 "solved": bool(goal[max(n - 1, 0)]) if done.any() else False}
 
-    return evaluate, trace_episode
+
+    from kinetix.render.renderer_pixels import make_render_pixels  # after the env import: kinetix has a circular import
+
+    _render = jax.jit(make_render_pixels(_env_params, _static.replace(downscale=1)))
 
 
-@app.cell
-def _(ROOT, json):
+    def _frames(tr, stride=2, top=250):
+        # states[i] is the state after i steps, so states[steps] is the final state (capped by the 256-step scan)
+        idx = list(range(0, tr["steps"], stride)) + [min(tr["steps"], 255)]
+        frames = []
+        for i in idx:
+            f = np.asarray(_render(jax.tree.map(lambda x: x[i], tr["states"])))
+            frames.append(np.flipud(np.transpose(f, (1, 0, 2)))[top:].astype(np.uint8))
+        return frames, idx
+
+
+    def animate(*episodes):
+        """Animated GIF of traced episodes side by side: animate((trace, "label"), (trace, "label"), ...)."""
+        import base64
+        import io
+
+        import imageio.v2 as iio
+        from PIL import Image, ImageDraw, ImageFont
+
+        font = ImageFont.load_default(size=22)
+        panels = []
+        for tr, label in episodes:
+            frames, idx = _frames(tr)
+            out = []
+            for f, i in zip(frames, idx):
+                im = Image.fromarray(f)
+                status = ("solved" if tr["solved"] else "not solved") if i == idx[-1] else ""
+                ImageDraw.Draw(im).text((12, 10), f"{label}   step {i}   {status}", fill=(20, 20, 20), font=font)
+                out.append(np.asarray(im))
+            panels.append(out)
+        gap = np.full((panels[0][0].shape[0], 10, 3), 255, np.uint8)
+        frames = []
+        for i in range(max(len(p) for p in panels)):
+            row = []
+            for p in panels:
+                row += [p[min(i, len(p) - 1)], gap]
+            frames.append(np.concatenate(row[:-1], axis=1))
+        buf = io.BytesIO()
+        iio.mimwrite(buf, frames, format="GIF", duration=60, loop=0)
+        return mo.Html(f"<img alt='car-ramp episodes' style='width:{min(100, 50 * len(episodes))}%' src='data:image/gif;base64,{base64.b64encode(buf.getvalue()).decode()}'>")
+
+    return animate, evaluate, trace_episode
+
+
+@app.cell(hide_code=True)
+def _(PALETTE, ROOT, alt, json, mo, pd):
     import re
 
+    # every RESULT line the orx runs printed, to set next to what you run here
     recorded = []
     for _f in sorted((ROOT / "data" / "logs").glob("*.log")):
         for _m in re.finditer(r"RESULT (\{.*\})", _f.read_text()):
             recorded.append(json.loads(_m.group(1)))
 
 
-    def recorded_result(weights_file, seed=0, argmax=False, episodes=None):
-        for r in recorded:
-            if r["weights"].endswith(weights_file) and r["seed"] == seed and r["argmax"] == argmax and (episodes is None or r["episodes"] == episodes):
-                return r
-        return None
-
-    return recorded, recorded_result
-
-
-@app.cell
-def _(mo, networks):
-    one_net = mo.ui.dropdown(list(networks), value="greedy-12", label="network")
-    one_eps = mo.ui.dropdown(["64", "256", "1024"], value="256", label="episodes")
-    one_seed = mo.ui.number(0, 99, value=0, label="seed")
-    one_argmax = mo.ui.checkbox(label="argmax")
-    one_run = mo.ui.run_button(label="▶ run")
-    mo.vstack([mo.md("### 1.3 Run one evaluation"), mo.hstack([one_net, one_eps, one_seed, one_argmax], justify="start"), one_run])
-    return one_argmax, one_eps, one_net, one_run, one_seed
+    def recorded_run(weights_file=None, episodes=None, seed=0, tag=None):
+        """The recorded orx RESULT for a network file (or a tag), preferring the same episode count."""
+        hits = [r for r in recorded if not r["argmax"] and r["seed"] == seed
+                and (tag is None or r["tag"] == tag) and (weights_file is None or r["weights"].endswith(weights_file))]
+        same = [r for r in hits if r["episodes"] == episodes]
+        return (same or hits or [None])[0]
 
 
-@app.cell
-def _(
-    SHIPPED,
-    evaluate,
-    mo,
-    networks,
-    one_argmax,
-    one_eps,
-    one_net,
-    one_run,
-    one_seed,
-    recorded_result,
-):
-    _rec = recorded_result(SHIPPED[one_net.value], int(one_seed.value), one_argmax.value)
-    _rec_txt = (f"Recorded orx run (`{_rec['label']}`, {_rec['episodes']} episodes): **{_rec['success_count']}/{_rec['episodes']}** solved, mean length {_rec['mean_len']:.1f}."
-                if _rec else "No recorded orx run with this seed and action mode.")
-    mo.stop(not one_run.value, mo.md(f"{_rec_txt}<br>_Press **run** to run it here (the first run compiles for ~10 s)._"))
-    _r = evaluate(networks[one_net.value], int(one_eps.value), int(one_seed.value), one_argmax.value)
-    mo.md(f"**Re-run now:** solved **{_r['success_count']}/{_r['episodes']}** · red wall {100*_r['red']:.1f}% · timeout {100*_r['timeout']:.1f}% · "
-          f"mean length {_r['mean_len']:.1f} steps · {_r['wall_s']} s<br>{_rec_txt}")
-    return
+    def report(name, r, rec=None):
+        """One evaluation as a line of text, with the recorded orx run when there is one."""
+        txt = (f"**{name}**: solved **{r['success_count']}/{r['episodes']}** · hit red {100 * r['red']:.0f}% · "
+               f"timed out {100 * r['timeout']:.0f}% · mean episode {r['mean_len']:.0f} steps · {r['wall_s']} s")
+        if rec is not None:
+            same = rec["episodes"] == r["episodes"] and rec["success_count"] == r["success_count"] and round(rec["mean_len"], 3) == round(r["mean_len"], 3)
+            txt += (f"<br>recorded orx run ({rec['episodes']} episodes, seed {rec['seed']}): {rec['success_count']}/{rec['episodes']}, "
+                    f"mean {rec['mean_len']:.0f} steps" + (" — **identical**" if same else ""))
+        return mo.md(txt)
 
 
-@app.cell
-def _(mo):
-    ladder_eps = mo.ui.dropdown(["256", "1024"], value="256", label="episodes per network")
-    ladder_run = mo.ui.run_button(label="▶ run the whole ladder")
-    mo.vstack([
-        mo.md("### 1.4 The ladder — every rung, re-run\n\nAll 8 networks at seed 0, sampled actions. 256 episodes ≈ 12 s per network; 1,024 ≈ 45 s."),
-        mo.hstack([ladder_eps, ladder_run], justify="start"),
-    ])
-    return ladder_eps, ladder_run
+    def progress_chart(order, done, recorded_counts, title):
+        """Bars for experiments run so far (blue) next to the recorded orx result (orange tick); pending rows stay empty."""
+        rows = []
+        for name in order:
+            r = done.get(name)
+            rec = recorded_counts.get(name)
+            rows.append({"run": name, "solved (%)": None if r is None else round(100 * r["success_count"] / r["episodes"], 1),
+                         "recorded (%)": None if rec is None else round(100 * rec[0] / rec[1], 1),
+                         "label": "running…" if r is None else f"{r['success_count']}/{r['episodes']}"})
+        df = pd.DataFrame(rows)
+        y = alt.Y("run:N", sort=order, title=None, axis=alt.Axis(labelLimit=260))
+        x_scale = alt.Scale(domain=[0, 125])  # room right of 100% for the count labels
+        bars = alt.Chart(df).mark_bar(color=PALETTE["blue"]).encode(
+            x=alt.X("solved (%):Q", scale=x_scale, title="episodes solved (%)", axis=alt.Axis(values=[0, 25, 50, 75, 100])), y=y,
+            tooltip=["run", "solved (%)", "recorded (%)"])
+        ticks = alt.Chart(df).mark_tick(color=PALETTE["orange"], thickness=3, size=18).encode(x=alt.X("recorded (%):Q", scale=x_scale, title="episodes solved (%)"), y=y)
+        pending = alt.Chart(df).transform_filter("datum['solved (%)'] === null").mark_text(align="left", dx=4, color="#888").encode(
+            x=alt.XDatum(0, scale=x_scale), y=y, text="label:N")
+        labels = alt.Chart(df).transform_filter("datum['solved (%)'] !== null").mark_text(align="left", dx=8).encode(
+            x=alt.X("solved (%):Q", scale=x_scale, title="episodes solved (%)"), y=y, text="label:N")
+        n_done = sum(r is not None for r in done.values())
+        return mo.vstack([
+            mo.md(f"**{title}** — {n_done}/{len(order)} done. Blue: this run. Orange tick: the recorded orx run."),
+            (bars + ticks + labels + pending).properties(width=360, height=24 * len(order)),
+        ])
+
+    return progress_chart, recorded_run, report
 
 
-@app.cell
-def _(
-    PALETTE,
-    SHIPPED,
-    changed_entries,
-    evaluate,
-    ladder_eps,
-    ladder_run,
-    mo,
-    networks,
-    np,
-    plt,
-    recorded_result,
-):
-    _live = ladder_run.value
-    _eps = int(ladder_eps.value)
-    _items = list(networks.items())
-    _rows, _rec_rate, _live_rate = [], [], []
-    for _name, _W in (mo.status.progress_bar(_items, title="evaluating") if _live else _items):
-        _rec = recorded_result(SHIPPED[_name], 0, False, 1024)
-        _row = {"network": _name, "entries": 0 if _name == "base PPO" else len(changed_entries(_W)),
-                "recorded orx run (1,024 ep, seed 0)": f"{_rec['success_count']}/1024 · len {_rec['mean_len']:.0f}"}
-        _rec_rate.append(_rec["success_count"] / 1024)
-        if _live:
-            _r = evaluate(_W, _eps, 0)
-            _row[f"re-run now ({_eps} ep, seed 0)"] = f"{_r['success_count']}/{_eps} · len {_r['mean_len']:.0f}"
-            _live_rate.append(_r["success_count"] / _eps)
-        _rows.append(_row)
-    _fig, _ax = plt.subplots(figsize=(7, 3.6))
-    _y = np.arange(len(_rows))[::-1]
-    _h = 0.38 if _live else 0.6
-    _series = [("recorded orx run", _rec_rate, PALETTE["orange"], -_h / 2 if _live else 0)]
-    if _live:
-        _series.append(("re-run now", _live_rate, PALETTE["blue"], _h / 2))
-    for _lab, _vals, _col, _off in _series:
-        _ax.barh(_y + _off, _vals, _h, color=_col, label=_lab)
-        for _yy, _v in zip(_y + _off, _vals):
-            _ax.text(_v + 0.01, _yy, f"{100 * _v:.0f}%", va="center", fontsize=8)
-    _ax.set_yticks(_y, [f"{r['network']} — {r['entries']:,} entries" for r in _rows])
-    _ax.set_xlabel("episodes solved")
-    _ax.set_xlim(0, 1.12)
-    _ax.legend(loc="lower right", bbox_to_anchor=(1, 1.01), ncol=2, frameon=False)
-    _fig.tight_layout()
-    mo.vstack([
-        mo.md("_Showing the recorded orx runs. Press **run the whole ladder** to re-run every network here._" if not _live
-              else f"_Re-ran all {len(_rows)} networks just now. Sampled episodes use the same seed and key schedule as the orx runs, so at 1,024 episodes the counts match exactly._"),
-        mo.ui.table(_rows, selection=None, pagination=False), _fig,
-    ])
-    return
-
-
-@app.cell
-def _(mo):
-    drop_run = mo.ui.run_button(label="▶ run drop-one audit (12 × 256 episodes)")
-    mo.vstack([
-        mo.md("### 1.5 Drop-one audit of greedy-12\n\nRevert each of the 12 entries to its rounded-base value and re-evaluate (256 episodes, seed 0) — the `H_greedy12_min` experiment."),
-        drop_run,
-    ])
-    return (drop_run,)
-
-
-@app.cell
-def _(
-    GREEDY12,
-    PALETTE,
-    apply_entries,
-    drop_run,
-    evaluate,
-    mo,
-    np,
-    plt,
-    recorded,
-):
-    _live = drop_run.value
-    _logged = {r["tag"]: r for r in recorded if r["label"] == "H_greedy12_min"}
-    _rows = []
-    for _i in (mo.status.progress_bar(range(12), title="drop-one") if _live else range(12)):
-        _t, _idx, _ = GREEDY12[_i]
-        _l = _logged[f"drop-{_i:02d}"]
-        _row = {"dropped entry": f"{_t}[{','.join(map(str, _idx))}]",
-                "recorded orx run (256 ep)": f"{_l['success_count']}/256 · len {_l['mean_len']:.0f}", "_rec": _l["success_count"]}
-        if _live:
-            _r = evaluate(apply_entries([e for j, e in enumerate(GREEDY12) if j != _i]), 256, 0)
-            _row["re-run now"] = f"{_r['success_count']}/256 · len {_r['mean_len']:.0f}"
-            _row["_now"] = _r["success_count"]
-        _rows.append(_row)
-    _fig, _ax = plt.subplots(figsize=(7, 4.2))
-    _y = np.arange(12)[::-1]
-    _h = 0.38 if _live else 0.6
-    _series = [("recorded orx run", [r["_rec"] for r in _rows], PALETTE["orange"], -_h / 2 if _live else 0)]
-    if _live:
-        _series.append(("re-run now", [r["_now"] for r in _rows], PALETTE["blue"], _h / 2))
-    for _lab, _vals, _col, _off in _series:
-        _ax.barh(_y + _off, [v / 256 for v in _vals], _h, color=_col, label=_lab)
-        for _yy, _v in zip(_y + _off, _vals):
-            _ax.text(_v / 256 + 0.01, _yy, f"{_v}/256", va="center", fontsize=8)
-    _ax.set_yticks(_y, [r["dropped entry"] for r in _rows])
-    _ax.set_xlabel("episodes solved with this entry removed")
-    _ax.set_xlim(0, 1.15)
-    _ax.legend(loc="lower right", bbox_to_anchor=(1, 1.01), ncol=2, frameon=False)
-    _fig.tight_layout()
-    mo.vstack([
-        mo.md("_Showing the recorded orx run. Press the button to re-run it here._" if not _live else "_Re-ran all 12 just now._"),
-        _fig,
-        mo.md("Ten entries are each indispensable (0/256 without them). `actor1.W[122,126]` is redundant: dropping it gives the 11-entry edit. "
-              "Dropping `actor_head.b[0]` costs 24 episodes."),
-        mo.ui.table([{k: v for k, v in r.items() if not k.startswith("_")} for r in _rows], selection=None, pagination=False),
-    ])
-    return
-
-
-@app.cell
-def _(KEEP_1939, apply_entries, astra, mo):
-    restore_run = mo.ui.run_button(label="▶ run embed-restore ablation (3 × 256 episodes)")
-    # joint_free keeps 1,884 embed.W erases: Astra zeroed most of embed columns 6/7/8 so those dead units
-    # read only one observation each (car x, car vx, green-wheel x). Restoring a column = undo its erases.
-    restore_nets = {
-        _c: apply_entries([e for e in KEEP_1939 if not (e[0] == "embed.W" and e[1][1] == _c and astra["embed.W"][e[1]] == 0)])
-        for _c in (6, 7, 8)
-    }
-    mo.vstack([
-        mo.md("### 1.6 Why the 1,884 embed erases matter (`H_embed_restore`)\n\n"
-              "In `joint_free`, the only large group left is 1,884 zeroed entries in embed columns 6/7/8. "
-              "They turn three dead ReLU units into clean single-input taps (x, vx, green-x). Undo one column's erases:"),
-        restore_run,
-    ])
-    return restore_nets, restore_run
-
-
-@app.cell
-def _(evaluate, mo, recorded, restore_nets, restore_run):
-    _logged = {r["tag"]: r for r in recorded if r["label"] == "H_embed_restore"}
-    _rows = []
-    for _c, _W in restore_nets.items():
-        _l = _logged[f"restore-col{_c}-s0"]
-        _row = {"restored column": _c, "unit reads": {6: "car x", 7: "car vx", 8: "green-wheel x"}[_c],
-                "recorded orx run (256 ep)": f"{_l['success_count']}/256 · len {_l['mean_len']:.0f}"}
-        if restore_run.value:
-            _r = evaluate(_W, 256, 0)
-            _row["re-run now"] = f"{_r['success_count']}/256 · len {_r['mean_len']:.0f} · {'red wall' if _r['red'] > 0.5 else 'timeout'}"
-        _rows.append(_row)
-    mo.vstack([
-        mo.md("_Showing the recorded orx run. Press the button to re-run it here._" if not restore_run.value else "_Re-ran just now._"),
-        mo.ui.table(_rows, selection=None, pagination=False),
-        mo.md("Undoing any one column's erases breaks the task. `data/docs/car-ramp/report.md` traces each failure to the comparator that column feeds."),
-    ])
-    return
-
-
-@app.cell
-def _(mo, networks):
-    trace_net = mo.ui.dropdown(list(networks), value="greedy-12", label="network")
-    trace_units = mo.ui.text(value="0:122, 0:127, 1:126, 2:126", label="hidden units to plot (actor layer:unit)", full_width=True)
-    mo.vstack([
-        mo.md("### 1.7 Mechanism trace — what the patch does, step by step\n\n"
-              "One argmax episode. Unit `L:u` is the tanh output of `actor{L}` unit `u`. For greedy-12 the chain is "
-              "PPO's own speed detector `0:122` → gate `1:126` → relay `2:126`; the green comparator is `0:127`. "
-              "For C2-min try `0:23, 1:29, 2:105, 4:73`. Base PPO for comparison."),
-        mo.hstack([trace_net, trace_units], widths=[1, 2]),
-    ])
-    return trace_net, trace_units
-
-
-@app.cell
-def _(PALETTE, mo, networks, np, plt, trace_episode, trace_net, trace_units):
-    _tr = trace_episode(networks[trace_net.value])
-    _base = trace_episode(networks["base PPO"])
-    _units = [tuple(int(x) for x in s.split(":")) for s in trace_units.value.replace(" ", "").split(",") if ":" in s]
-    _fig, _axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
-    _t = np.arange(_tr["steps"])
-    _axes[0].plot(_t, _tr["obs"][:, 0], color=PALETTE["blue"], label="car x")
-    _axes[0].plot(_t, _tr["obs"][:, 1], color=PALETTE["orange"], label="car vx")
-    _axes[0].plot(_t, _tr["obs"][:, 2], color=PALETTE["green"], label="green-wheel x")
-    _axes[0].plot(np.arange(_base["steps"]), _base["obs"][:, 0], color=PALETTE["blue"], alpha=0.3, linestyle="--", label="car x (base PPO)")
-    _axes[0].set_ylabel("observation")
-    _axes[0].legend(loc="upper left", bbox_to_anchor=(1.01, 1), frameon=False)
-    for _k, (_L, _u) in enumerate(_units):
-        _axes[1].plot(_t, _tr["h"][:, _L + 1, _u], label=f"{_L}:{_u}", color=list(PALETTE.values())[_k % 7])
-    _axes[1].set_ylabel("unit activation")
-    _axes[1].legend(loc="upper left", bbox_to_anchor=(1.01, 1), frameon=False)
-    for _a, _lab in enumerate(["motor action 0", "motor action 1", "motor action 2"]):
-        _axes[2].plot(_t, _tr["probs"][:, _a], label=_lab)
-    _axes[2].set_ylabel("action probability")
-    _axes[2].set_xlabel("step")
-    _axes[2].legend(loc="upper left", bbox_to_anchor=(1.01, 1), frameon=False)
-    _fig.tight_layout()
-    mo.vstack([mo.md(f"**{trace_net.value}**: {'solved' if _tr['solved'] else 'not solved'} in {_tr['steps']} steps "
-                     f"(base PPO: {'solved' if _base['solved'] else 'not solved'}, {_base['steps']} steps)."), _fig])
-    return
-
-
-@app.cell
-def _(mo):
-    play_text = mo.ui.text_area(
-        value="\n".join([
-            "# rounded base + these entries. Format: tensor[i,j] = value   (tensors: embed.W/b, actor0-4.W/b, actor_head.W/b)",
-            "# C2-min-10, the from-scratch 10-entry fix. Delete a line, change a gain, or write your own circuit.",
-            "embed.b[26] = 15.2", "actor0.W[116,23] = 8", "actor1.W[114,29] = 12", "actor1.W[23,29] = 12",
-            "actor1.b[29] = -18", "actor2.W[29,105] = 10", "actor3.W[105,17] = 10", "actor4.W[17,73] = 10",
-            "actor_head.W[73,1] = -40", "actor_head.W[73,2] = 40",
-        ]),
-        rows=14, full_width=True,
-    )
-    play_eps = mo.ui.dropdown(["64", "256", "1024"], value="256", label="episodes")
-    play_run = mo.ui.run_button(label="▶ build & evaluate")
-    mo.vstack([mo.md("### 1.8 Edit playground"), play_text, mo.hstack([play_eps, play_run], justify="start")])
-    return play_eps, play_run, play_text
-
-
-@app.cell
-def _(
-    apply_entries,
-    evaluate,
-    mo,
-    play_eps,
-    play_run,
-    play_text,
-    rounded,
-    trace_episode,
-):
-    import re as _re
-
-    _entries, _errors = [], []
-    for _ln, _line in enumerate(play_text.value.splitlines(), 1):
-        _line = _line.split("#")[0].strip()
-        if not _line:
-            continue
-        _m = _re.fullmatch(r"([\w.]+)\[([\d,\s]+)\]\s*=\s*([-+.\deE]+)", _line)
-        if not _m or _m.group(1) not in rounded:
-            _errors.append(f"line {_ln}: can't parse `{_line}`")
-            continue
-        _idx = tuple(int(x) for x in _m.group(2).split(","))
-        if len(_idx) != rounded[_m.group(1)].ndim or any(i >= s for i, s in zip(_idx, rounded[_m.group(1)].shape)):
-            _errors.append(f"line {_ln}: index {_idx} out of range for {_m.group(1)} {rounded[_m.group(1)].shape}")
-            continue
-        _entries.append((_m.group(1), _idx, float(_m.group(3))))
-    mo.stop(bool(_errors), mo.md("**Fix these first:**<br>" + "<br>".join(_errors)))
-    mo.stop(not play_run.value, mo.md(f"_{len(_entries)} entries parsed. Press **build & evaluate**._"))
-    _W = apply_entries(_entries)
-    _r = evaluate(_W, int(play_eps.value), 0)
-    _tr = trace_episode(_W)
-    mo.md(f"**{len(_entries)} entries** → solved **{_r['success_count']}/{_r['episodes']}** · red {100*_r['red']:.0f}% · "
-          f"timeout {100*_r['timeout']:.0f}% · mean length {_r['mean_len']:.1f} · argmax episode: "
-          f"{'solved' if _tr['solved'] else 'not solved'} in {_tr['steps']} steps")
-    return
-
-
-@app.cell
+@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ---
-    ## 2 · Experiment 8: Qwen3.5-0.8B math edit, and how much of it is needed
-
-    Astra's p50c edit makes Qwen3.5-0.8B stop looping on math (MATH-500 7.9% → 48.1% in the published
-    evaluation). It touches `layers.{15,19}.mlp.down_proj.weight` (1024 × 3584, bf16) and changes
-    **130,188** entries. The minimal-edit campaign built 27 subsets of it and screened each on the same
-    256 MATH-train problems (vLLM, thinking on, temp 0.6, 32k tokens, n = 1).
+    ### 1.2 Experiment: does the base network solve the level?
     """)
     return
 
 
 @app.cell
-def _(EX, json, np):
+def _(EPISODES, SEED, base_raw, evaluate, recorded_run, report):
+    base_result = evaluate(base_raw, EPISODES, SEED)  # the first evaluation also compiles the rollout (~10 s)
+    report("base PPO", base_result, recorded_run("base_ppo_final_seed0.npz", EPISODES, SEED))
+    return
+
+
+@app.cell
+def _(animate, base_raw, trace_episode):
+    base_trace = trace_episode(base_raw)
+    animate((base_trace, "base PPO"))
+    return (base_trace,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    It drives toward the goal, climbs onto the ramp and stalls there until the episode times out. It never backs up:
+    at the start p(reverse) ≈ 10⁻¹².
+
+    ### 1.3 Experiment: Astra's 6,073-entry edit
+    """)
+    return
+
+
+@app.cell
+def _(CR, mo, np, rounded):
+    _ed = np.load(CR / "edited_actor.npz")
+    astra = {k: _ed[k].astype(np.float64) for k in _ed.files}
+
+
+    def changed_entries(W):
+        """(tensor, index) of every weight that differs from the rounded base."""
+        return [(k, tuple(int(i) for i in ix)) for k in rounded for ix in zip(*np.nonzero(W[k] != rounded[k]))]
+
+
+    _changed = changed_entries(astra)
+    _erased = sum(astra[t][i] == 0 for t, i in _changed)
+    mo.md(f"{len(_changed):,} entries changed: {_erased:,} set to zero, {len(_changed) - _erased} given new values")
+    return astra, changed_entries
+
+
+@app.cell
+def _(EPISODES, SEED, animate, astra, base_trace, evaluate, mo, recorded_run, report, trace_episode):
+    astra_result = evaluate(astra, EPISODES, SEED)
+    astra_trace = trace_episode(astra)
+    mo.vstack([
+        report("Astra edit", astra_result, recorded_run("edited_actor.npz", EPISODES, SEED)),
+        animate((base_trace, "base PPO"), (astra_trace, "Astra edit")),
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    The edited car backs up to the right first, then drives left over the ramp into the goal.
+
+    ### 1.4 Experiment: strip the edit down — the ladder
+
+    Each rung keeps fewer of Astra's entries (or, for C2, writes new ones from scratch) on top of the rounded base.
+    The recipes are plain lists of `(tensor, index, value)`; `None` means "Astra's value at that index".
+    """)
+    return
+
+
+@app.cell
+def _(CR, astra, changed_entries, json, np, rounded):
+    def apply_entries(entries):
+        """Rounded base + entries; each entry is (tensor, index, value), value None = Astra's value there."""
+        W = {k: v.copy() for k, v in rounded.items()}
+        for t, idx, val in entries:
+            W[t][tuple(idx)] = astra[t][tuple(idx)] if val is None else val
+        return W
+
+
+    # 55 functional entries + the 1,884 embed erasures; the ten downstream erasure groups are reverted
+    KEEP_1939 = [(t, tuple(i), None) for t, i in json.load(open(CR / "keep_joint_free.json"))]
+    # the 1,718 waypoint's keep-list was not saved; read its entry set from the shipped checkpoint
+    _wp = np.load(CR / "greedy_waypoint_1718.npz")
+    WAYPOINT_1718 = [(t, i, None) for t, i in changed_entries({k: _wp[k].astype(np.float64) for k in _wp.files})]
+    # greedy drop search on Astra's own entries, run to a fixed point
+    GREEDY12 = [(t, tuple(i), None) for t, i in json.load(open(CR.parent / "car-ramp-evidence" / "greedy_gf5_final.json"))]
+    GREEDY11 = [e for e in GREEDY12 if e[:2] != ("actor1.W", (122, 126))]
+    # designed from scratch, no erasures
+    C2_14 = [(t, tuple(i), float(v)) for t, i, v in json.load(open(CR / "c2_edits.json"))]
+    C2_MIN_10 = [e for e in C2_14 if e[:2] not in {("embed.W", (52, 26)), ("actor0.W", (26, 114)), ("actor0.b", (23,)), ("actor0.b", (114,))}]
+
+    ladder_networks = {
+        "Astra edit (6,073)": astra,
+        "joint_free (1,939)": apply_entries(KEEP_1939),
+        "waypoint (1,718)": apply_entries(WAYPOINT_1718),
+        "greedy-12": apply_entries(GREEDY12),
+        "greedy-11": apply_entries(GREEDY11),
+        "C2, from scratch (14)": apply_entries(C2_14),
+        "C2-min, from scratch (10)": apply_entries(C2_MIN_10),
+    }
+    {name: len(changed_entries(W)) for name, W in ladder_networks.items()}
+    return GREEDY12, KEEP_1939, apply_entries, ladder_networks
+
+
+@app.cell
+def _(CR, NAME_MAP, ladder_networks, np, rounded):
+    # check: every network rebuilt above is bit-identical to the one the orx runs evaluated
+    SHIPPED = {"Astra edit (6,073)": "edited_actor.npz", "joint_free (1,939)": "joint_free.npz",
+               "waypoint (1,718)": "greedy_waypoint_1718.npz", "greedy-12": "greedy12_astra.npz", "greedy-11": "greedy11_drop02.npz",
+               "C2, from scratch (14)": "c2_14entry.npz", "C2-min, from scratch (10)": "c2_min_10entry.npz"}
+    {name: all(np.array_equal(W[k], np.load(CR / SHIPPED[name])[k].astype(np.float64)) for k in rounded)
+     for name, W in ladder_networks.items()}
+    return (SHIPPED,)
+
+
+@app.cell
+def _(EPISODES, SEED, SHIPPED, evaluate, ladder_networks, mo, progress_chart, recorded_run):
+    _rec = {n: recorded_run(SHIPPED[n], EPISODES, SEED) for n in ladder_networks}
+    _rec = {n: (r["success_count"], r["episodes"]) for n, r in _rec.items() if r}
+
+    ladder_results = {}
+    for _name, _W in ladder_networks.items():
+        mo.output.replace(progress_chart(list(ladder_networks), ladder_results, _rec, "The ladder"))
+        ladder_results[_name] = evaluate(_W, EPISODES, SEED)
+    progress_chart(list(ladder_networks), ladder_results, _rec, "The ladder")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Every rung solves the level. The behavior needs a handful of weights, not 6,073: the 12-entry fixed point is a
+    subset of Astra's own edit, and C2-min reaches the same with 10 entries written from scratch.
+
+    ### 1.5 Experiment: is every one of the 12 needed?
+
+    Remove each entry of greedy-12 in turn (revert it to the rounded base) and re-evaluate.
+    """)
+    return
+
+
+@app.cell
+def _(EPISODES, GREEDY12, SEED, apply_entries, evaluate, mo, progress_chart, recorded_run):
+    _labels = [f"without {t}[{','.join(map(str, i))}]" for t, i, _ in GREEDY12]
+    _rec = {}
+    for _k, _lab in enumerate(_labels):
+        _r = recorded_run(tag=f"drop-{_k:02d}", episodes=EPISODES, seed=SEED)
+        if _r and _r["episodes"] == EPISODES:
+            _rec[_lab] = (_r["success_count"], _r["episodes"])
+
+    drop_results = {}
+    for _k, _lab in enumerate(_labels):
+        mo.output.replace(progress_chart(_labels, drop_results, _rec, "Drop one entry of greedy-12"))
+        drop_results[_lab] = evaluate(apply_entries(GREEDY12[:_k] + GREEDY12[_k + 1:]), EPISODES, SEED)
+    progress_chart(_labels, drop_results, _rec, "Drop one entry of greedy-12")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Ten of the twelve are each indispensable. `actor1.W[122,126]` is redundant (dropping it gives greedy-11), and
+    `actor_head.b[0]` only costs a few episodes.
+
+    ### 1.6 Experiment: why keep the 1,884 erasures in `joint_free`?
+
+    Astra zeroed most of embed columns 6, 7 and 8, turning three dead ReLU units into clean single-input taps for car x,
+    car vx and green-wheel x. Undo one column's erasures at a time:
+    """)
+    return
+
+
+@app.cell
+def _(EPISODES, KEEP_1939, SEED, apply_entries, astra, evaluate, mo, progress_chart, recorded_run):
+    restore_networks = {
+        f"restore column {c} (reads {what})": apply_entries(
+            [e for e in KEEP_1939 if not (e[0] == "embed.W" and e[1][1] == c and astra["embed.W"][e[1]] == 0)])
+        for c, what in ((6, "car x"), (7, "car vx"), (8, "green-wheel x"))
+    }
+    _rec = {}
+    for _name, _c in zip(restore_networks, (6, 7, 8)):
+        _r = recorded_run(tag=f"restore-col{_c}-s0", episodes=EPISODES, seed=SEED)
+        if _r and _r["episodes"] == EPISODES:
+            _rec[_name] = (_r["success_count"], _r["episodes"])
+
+    restore_results = {}
+    for _name, _W in restore_networks.items():
+        mo.output.replace(progress_chart(list(restore_networks), restore_results, _rec, "Restore one embed column"))
+        restore_results[_name] = evaluate(_W, EPISODES, SEED)
+    progress_chart(list(restore_networks), restore_results, _rec, "Restore one embed column")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Every restore breaks the task: those erasures are what make the three taps clean.
+
+    ### 1.7 Look inside: what the 12 entries do
+
+    Trace one episode and watch the units the edit wires together. Unit `L:u` is the tanh output of `actor{L}` unit
+    `u`. In greedy-12, PPO's own speed detector `0:122` feeds a gate `1:126`, which drives a relay `2:126`; `0:127` is
+    a green-wheel comparator. For C2-min try `0:23, 1:29, 2:105, 4:73`.
+    """)
+    return
+
+
+@app.cell
+def _(ladder_networks):
+    TRACE_NETWORK = "greedy-12"  # any key of ladder_networks
+    TRACE_UNITS = [(0, 122), (0, 127), (1, 126), (2, 126)]  # (actor layer, unit)
+    inside_W = ladder_networks[TRACE_NETWORK]
+    return TRACE_NETWORK, TRACE_UNITS, inside_W
+
+
+@app.cell
+def _(PALETTE, TRACE_NETWORK, TRACE_UNITS, base_trace, inside_W, np, plt, trace_episode):
+    inside_trace = trace_episode(inside_W)
+    _t = np.arange(inside_trace["steps"])
+    _fig, _axes = plt.subplots(3, 1, figsize=(8, 6.5), sharex=True)
+    _axes[0].plot(_t, inside_trace["obs"][:, 0], color=PALETTE["blue"], label="car x")
+    _axes[0].plot(_t, inside_trace["obs"][:, 1], color=PALETTE["orange"], label="car vx")
+    _axes[0].plot(_t, inside_trace["obs"][:, 2], color=PALETTE["green"], label="green-wheel x")
+    _axes[0].plot(np.arange(base_trace["steps"]), base_trace["obs"][:, 0], color=PALETTE["blue"], alpha=0.3, linestyle="--", label="car x, base PPO")
+    _axes[0].set_ylabel("observation")
+    for _k, (_L, _u) in enumerate(TRACE_UNITS):
+        _axes[1].plot(_t, inside_trace["h"][:, _L + 1, _u], label=f"{_L}:{_u}", color=list(PALETTE.values())[_k % 7])
+    _axes[1].set_ylabel("unit activation")
+    for _a in range(3):
+        _axes[2].plot(_t, inside_trace["probs"][:, _a], label=f"motor action {_a}")
+    _axes[2].set_ylabel("action probability")
+    _axes[2].set_xlabel("step")
+    for _ax in _axes:
+        _ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), frameon=False)
+    _axes[0].set_title(f"{TRACE_NETWORK}: {'solved' if inside_trace['solved'] else 'not solved'} in {inside_trace['steps']} steps")
+    _fig.tight_layout()
+    _fig
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 1.8 Your turn: write an edit
+
+    Edit the list and rerun the cell. Each entry sets one weight on top of the rounded base:
+    `(tensor, index, value)`. Tensors are `embed.W`, `embed.b`, `actor0.W` … `actor4.b`, `actor_head.W`,
+    `actor_head.b`. It starts as C2-min; try deleting a line or changing a gain.
+    """)
+    return
+
+
+@app.cell
+def _(
+    EPISODES,
+    SEED,
+    animate,
+    apply_entries,
+    base_trace,
+    evaluate,
+    mo,
+    report,
+    trace_episode,
+):
+    my_edit = [
+        ("embed.b", (26,), 15.2),
+        ("actor0.W", (116, 23), 8.0),
+        ("actor1.W", (114, 29), 12.0),
+        ("actor1.W", (23, 29), 12.0),
+        ("actor1.b", (29,), -18.0),
+        ("actor2.W", (29, 105), 10.0),
+        ("actor3.W", (105, 17), 10.0),
+        ("actor4.W", (17, 73), 10.0),
+        ("actor_head.W", (73, 1), -40.0),
+        ("actor_head.W", (73, 2), 40.0),
+    ]
+    my_network = apply_entries(my_edit)
+    my_result = evaluate(my_network, EPISODES, SEED)
+    mo.vstack([
+        report(f"your edit ({len(my_edit)} entries)", my_result),
+        animate((base_trace, "base PPO"), (trace_episode(my_network), "your edit")),
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ---
+    ## 2 · Experiment 8: Qwen3.5-0.8B math edit, and how much of it is needed
+
+    Astra's p50c edit makes Qwen3.5-0.8B stop looping on math (MATH-500 7.9% → 48.1% in the published evaluation).
+    It changes **130,188** bf16 entries of `layers.{15,19}.mlp.down_proj.weight` (1024 × 3584 each). The minimal-edit
+    campaign built 27 subsets of it and screened each on the same 256 MATH-train problems (vLLM, thinking on, temp
+    0.6, 32k tokens, one sample each). Those screens ran on a GPU and are bundled as raw per-problem outputs; the
+    analysis below recomputes everything from them, and §2.5 lets you run the model yourself.
+
+    ### 2.1 Apply Astra's edit and recover what it is
+    """)
+    return
+
+
+@app.cell
+def _(EX, json, mo, np):
     def bf16_bits(x):
         u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
         return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
@@ -721,8 +721,8 @@ def _(EX, json, np):
 
 
     def build_bits(spec):
-        """Port of code/build_candidate.py: keep the subset of Astra's stored bf16 entries the spec selects
-        (cols/rows/entries per layer; missing key = no filter), optionally scaling the delta."""
+        """Keep the subset of Astra's stored bf16 entries a spec selects (cols/rows/entries per layer; a missing key
+        means no filter), optionally scaling the change. A port of the campaign's code/build_candidate.py."""
         out = {}
         for L in LAYERS:
             idx, val = edit_idx[L], edit_val[L]
@@ -751,6 +751,7 @@ def _(EX, json, np):
 
 
     astra_bits = build_bits({})
+    mo.md(" · ".join(f"layer {L}: {int((astra_bits[L] != base_bits[L]).sum()):,} entries changed" for L in LAYERS))
     return (
         LAYERS,
         W0,
@@ -778,77 +779,79 @@ def _(
     np,
     selected,
 ):
+    # SVD of the change, and Astra's closed form W = W0 - 6 u (m64 ⊙ uᵀW0) checked against the stored bits
     rank1 = {}
     _metrics = {}
     for _L in LAYERS:
         _D = bf16_to_f32(astra_bits[_L]).astype(np.float64) - W0[_L]
         _U, _s, _Vt = np.linalg.svd(_D, full_matrices=False)
         _sign = np.sign(_U[:, 0] @ np.load(EX / f"factors_layer{_L}.npz")["u"])
-        _u, _v = _U[:, 0] * _sign, _Vt[0] * _sign  # Δ = σ·u·vᵀ with u aligned to the campaign's factor
+        _u = _U[:, 0] * _sign  # aligned with the campaign's saved factor
         _mask = np.zeros(3584)
         _mask[selected[_L]] = 1
         _Wf = W0[_L] - 6.0 * np.outer(_u, _mask * (_u @ W0[_L]))
         _stored = bf16_to_f32(astra_bits[_L])[:, selected[_L]].astype(np.float64)
         _diff = np.abs(bf16_to_f32(bf16_bits(_Wf.astype(np.float32)))[:, selected[_L]] - _stored)
         _step = 2.0 ** (np.floor(np.log2(np.maximum(np.abs(_stored), 1e-30))) - 7)  # one bf16 rounding step at each value
-        rank1[_L] = {"u": _u, "v": _v, "c": _u @ W0[_L]}
+        rank1[_L] = {"u": _u, "c": _u @ W0[_L]}
         _metrics[_L] = {
-            "bf16 entries changed": f"{int((astra_bits[_L] != base_bits[_L]).sum()):,}",
             "columns (MLP neurons) touched": f"{int((_D != 0).any(0).sum())} of 3,584",
             "σ₂ / σ₁ of Δ (rank-1 ⇔ ≈ 0)": f"{_s[1] / _s[0]:.1e}",
             "‖Δ‖ / ‖W₀‖": f"{np.linalg.norm(_D) / np.linalg.norm(W0[_L]):.3f}",
-            "closed form within one bf16 step (of 65,536 touched)": f"{int((_diff <= _step).sum()):,}",
+            "closed form within one bf16 step (of 65,536)": f"{int((_diff <= _step).sum()):,}",
             "largest closed-form difference": f"{_diff.max():.1e}",
             "median |Δ| on touched entries": f"{np.median(np.abs(_D[:, selected[_L]])):.1e}",
             "Astra's own audit, exact u": f"rel. error {json.load(open(EX / 'frozen_edit_audit.json'))[str(_L)]['formula_relative_error']:.1e}",
         }
-    _rows = [{"": k, "layer 15": _metrics[15][k], "layer 19": _metrics[19][k]} for k in _metrics[15]]
-    _cos_u = abs(rank1[15]["u"] @ rank1[19]["u"])
     mo.vstack([
-        mo.md(r"""### 2.1 Apply the edit and recover what it is
-
-    Astra's stored bf16 entries are applied to the base tensors. An SVD of the change Δ shows it is rank-1, and Astra's
-    closed form
-
-    $$W = W_0 - 6\, u \left(m_{64} \odot u^\top W_0\right)$$
-
-    (u: unit repetition direction; m₆₄: mask of the 64 edited neurons) is checked against the stored values:"""),
-        mo.ui.table(_rows, selection=None, pagination=False),
-        mo.md(f"Both layers subtract almost the same direction, |cos(u₁₅, u₁₉)| = **{_cos_u:.3f}**. "
-              "Astra's exact u is not in the logs, so u here is estimated from Δ after bf16 rounding. That estimate reproduces "
-              "98–99% of the touched entries to within one rounding step; the rest are small weights (|w| < 0.002) where the "
-              "estimation error shows. Astra's run checked the formula against its exact u (last row, `frozen_edit_audit.json`)."),
+        mo.ui.table([{"": k, "layer 15": _metrics[15][k], "layer 19": _metrics[19][k]} for k in _metrics[15]], selection=None, pagination=False),
+        mo.md(f"The change is rank-1: one direction u subtracted through 64 MLP neurons per layer, the same direction in both layers "
+              f"(|cos(u₁₅, u₁₉)| = **{abs(rank1[15]['u'] @ rank1[19]['u']):.3f}**). Astra's exact u is not in the logs, so u here is "
+              "estimated from Δ after bf16 rounding; that reproduces 98–99% of the touched entries to within one rounding step, and "
+              "Astra's run checked the formula against its exact u (last row)."),
     ])
     return (rank1,)
 
 
 @app.cell
-def _(LAYERS, PALETTE, mo, np, plt, rank1, selected):
-    _fig, _axes = plt.subplots(1, 2, figsize=(7.5, 3.0))
-    _txt = []
-    for _ax, _L in zip(_axes, LAYERS):
+def _(LAYERS, PALETTE, alt, mo, np, pd, rank1, selected):
+    _rows, _txt = [], []
+    for _L in LAYERS:
         _c = np.abs(rank1[_L]["c"])
-        _order = np.argsort(-_c)
         _rank = np.empty(3584, int)
-        _rank[_order] = np.arange(3584)
-        _sel = selected[_L]
-        _ax.scatter(np.arange(1, 3585), _c[_order], s=2, color=PALETTE["blue"], alpha=0.3, label="all 3,584 neurons")
-        _ax.scatter(_rank[_sel] + 1, _c[_sel], s=12, color=PALETTE["orange"], label="the 64 Astra edited", zorder=3)
-        _ax.axvline(64.5, color="#999", linewidth=0.8, linestyle=":")
-        _ax.set_xscale("log")
-        _ax.set_xlabel("neuron rank by |u·W₀|")
-        _ax.set_ylabel("|u·W₀| (writing strength)")
-        _ax.set_title(f"layer {_L}")
-        _txt.append(f"layer {_L}: {int((_rank[_sel] < 64).sum())} of the 64 are among the 64 strongest writers; the weakest ranks {int(_rank[_sel].max()) + 1:,}")
-    _axes[0].legend(loc="lower left", frameon=False)
-    _fig.tight_layout()
+        _rank[np.argsort(-_c)] = np.arange(1, 3585)
+        _edited = np.zeros(3584, bool)
+        _edited[selected[_L]] = True
+        _rows.append(pd.DataFrame({"layer": f"layer {_L}", "neuron": np.arange(3584), "rank": _rank,
+                                   "writing strength |u·W₀|": _c, "edited by Astra": np.where(_edited, "yes", "no")}))
+        _txt.append(f"layer {_L}: {int((_rank[_edited] <= 64).sum())} of the 64 are among the 64 strongest writers, the weakest ranks {int(_rank[_edited].max()):,}")
     mo.vstack([
-        mo.md("**Which neurons were changed, and why those.** Each MLP neuron j writes the repetition direction with strength |u·W₀[:, j]|. "
-              "Astra did not just take the 64 strongest writers: it ranked neurons by writing strength × how much more the neuron fires "
-              "on looping text than on productive text (its notes, `data/docs/exp8/notes_astra_method.md`). "
-              + "; ".join(_txt) + ". The activation half of that score needs Astra's forward passes, which are not in this package."),
-        _fig,
+        mo.md("**Which neurons did Astra edit?** Neuron j writes the direction with strength |u·W₀[:, j]|. Astra did not take the "
+              "64 strongest writers: it ranked by strength × how much more the neuron fires on looping text (its notes, "
+              "`data/docs/exp8/notes_astra_method.md`). " + "; ".join(_txt) + ". Hover a point for its neuron number."),
+        alt.Chart(pd.concat(_rows)).mark_circle().encode(
+            x=alt.X("rank:Q", scale=alt.Scale(type="log"), title="neuron rank by writing strength (log)",
+                    axis=alt.Axis(values=[1, 10, 64, 100, 1000, 3584], format=",")),
+            y=alt.Y("writing strength |u·W₀|:Q"),
+            color=alt.Color("edited by Astra:N", scale=alt.Scale(domain=["no", "yes"], range=["#9DB4C8", PALETTE["red"]]),
+                            legend=alt.Legend(orient="bottom")),
+            size=alt.condition(alt.datum["edited by Astra"] == "yes", alt.value(28), alt.value(10)),
+            order=alt.Order("edited by Astra:N"),
+            tooltip=["layer", "neuron", "rank", alt.Tooltip("writing strength |u·W₀|:Q", format=".4f"), "edited by Astra"],
+        ).properties(width=230, height=220).facet(column=alt.Column("layer:N", title=None)).resolve_scale(y="independent"),
     ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 2.2 Experiment: build the campaign's 27 candidates
+
+    Each candidate keeps part of Astra's edit: the top-k neurons (A), the B largest entries per layer (D), the top-R
+    output rows of layer 15 (ER), or one layer only (B). `make_spec` regenerates the specs from the saved factors;
+    `build_bits` applies them. The check: same specs and same entry counts as the campaign.
+    """)
     return
 
 
@@ -870,102 +873,76 @@ def _(EX, LAYERS, json, np, selected):
 
 
     def make_spec(family, n):
-        """The campaign's candidate families (emit_specs.py)."""
-        if family == "A · top-k columns, both layers":
-            return {"scale": 1.0, "cols15": order_v[15][:n], "cols19": order_v[19][:n]}
-        if family == "D · top-B entries per layer":
-            return {"scale": 1.0, "entries15": top_entries(15, n), "entries19": top_entries(19, n)}
-        if family == "B · layer 15 only, top-k columns":
-            return {"scale": 1.0, "cols15": order_v[15][:n], "cols19": []}
-        if family == "B · layer 19 only, top-k columns":
-            return {"scale": 1.0, "cols19": order_v[19][:n], "cols15": []}
-        if family == "ER · layer 15 only, top-R rows":
-            return {"scale": 1.0, "rows15": order_u[15][:n], "cols19": []}
-        raise ValueError(family)
+        """The campaign's candidate families (emit_specs.py). family: "A", "D", "B15", "B19" or "ER"."""
+        return {
+            "A": lambda: {"scale": 1.0, "cols15": order_v[15][:n], "cols19": order_v[19][:n]},
+            "D": lambda: {"scale": 1.0, "entries15": top_entries(15, n), "entries19": top_entries(19, n)},
+            "B15": lambda: {"scale": 1.0, "cols15": order_v[15][:n], "cols19": []},
+            "B19": lambda: {"scale": 1.0, "cols19": order_v[19][:n], "cols15": []},
+            "ER": lambda: {"scale": 1.0, "rows15": order_u[15][:n], "cols19": []},
+        }[family]()
 
 
-    FAMILY_OF = {"A": ("A · top-k columns, both layers", lambda c: int(c.split("_topk")[1])),
-                 "D": ("D · top-B entries per layer", lambda c: int(c[1:].split("k_")[0]) * 1024),
-                 "ER": ("ER · layer 15 only, top-R rows", lambda c: int(c[2:].split("_")[0]))}
     CAMPAIGN_SPECS = {p.stem: json.load(open(p)) for p in sorted((EX / "specs").glob("*.json"))}
     CAMPAIGN_SPECS["B15_full_s125"] = {"scale": 1.25, "cols19": []}
-    CAMPAIGN_SPECS["G000_scale"] = {"scale": 0.0}
-    return CAMPAIGN_SPECS, FAMILY_OF, make_spec
+    CAMPAIGN_SPECS["G000_scale"] = {"scale": 0.0}  # the unedited base
+    return CAMPAIGN_SPECS, make_spec
 
 
 @app.cell
-def _(
-    CAMPAIGN_SPECS,
-    EX,
-    FAMILY_OF,
-    build_bits,
-    json,
-    make_spec,
-    mo,
-    n_changed,
-):
-    _recorded_counts = json.load(open(EX / "candidate_entries.json"))
-    _rows = []
+def _(CAMPAIGN_SPECS, EX, build_bits, json, make_spec, mo, n_changed):
+    _size = {"A": lambda c: int(c.split("_topk")[1]), "D": lambda c: int(c[1:].split("k_")[0]) * 1024,
+             "ER": lambda c: int(c[2:].split("_")[0])}
+    _recorded = json.load(open(EX / "candidate_entries.json"))
     entry_counts = {}
+    _rows = []
     for _cid, _spec in mo.status.progress_bar(list(CAMPAIGN_SPECS.items()), title="building candidates"):
         entry_counts[_cid] = n_changed(build_bits(_spec))
-        _fam = next((f for k, f in FAMILY_OF.items() if _cid.startswith(k)), None)
-        _regen = "—" if _fam is None else ("✅" if make_spec(_fam[0], _fam[1](_cid)) == _spec else "❌")
-        _rec = _recorded_counts.get(_cid)
+        _fam = next((k for k in ("ER", "A", "D") if _cid.startswith(k)), None)
         _rows.append({"candidate": _cid, "entries (built now)": entry_counts[_cid],
-                      "campaign's count": "—" if _rec is None else f"{_rec:,}",
-                      "same": "—" if _rec is None else ("✅" if _rec == entry_counts[_cid] else "❌"),
-                      "spec regenerated": _regen})
-    _rows.sort(key=lambda r: r["entries (built now)"])
-    mo.vstack([mo.md("### 2.2 Rebuild all campaign candidates\n\nEach spec is applied with `build_bits` (a port of the campaign's `build_candidate.py`); "
-                     "the A/D/ER families are also regenerated from scratch with `make_spec` and compared with the specs the campaign ran."),
-               mo.ui.table(_rows, selection=None, pagination=False, page_size=30)])
+                      "campaign's count": _recorded.get(_cid, "—"),
+                      "same": "—" if _cid not in _recorded else ("✅" if _recorded[_cid] == entry_counts[_cid] else "❌"),
+                      "spec regenerated": "—" if _fam is None else ("✅" if make_spec(_fam, _size[_fam](_cid)) == _spec else "❌")})
+    mo.ui.table(sorted(_rows, key=lambda r: r["entries (built now)"]), selection=None, pagination=False, page_size=30)
     return (entry_counts,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(mo):
-    fam = mo.ui.dropdown(["A · top-k columns, both layers", "D · top-B entries per layer", "B · layer 15 only, top-k columns",
-                          "B · layer 19 only, top-k columns", "ER · layer 15 only, top-R rows"],
-                         value="D · top-B entries per layer", label="family")
-    fam_n = mo.ui.number(1, 65536, value=4096, label="k / B / R")
-    mo.vstack([mo.md("### 2.3 Design a candidate\n\nAny size, not just the ones the campaign screened. The spec it prints is what `code/build_candidate.py` and §2.6–2.7 take."),
-               mo.hstack([fam, fam_n], justify="start")])
-    return fam, fam_n
+    mo.md(r"""
+    ### 2.3 Design your own candidate
+
+    Change the family and size, rerun, and the next sections use it (`my_spec`). D keeps the B largest entries per
+    layer, A the top-k neurons, ER the top-R rows of layer 15, B15/B19 one layer's top-k neurons.
+    """)
+    return
 
 
 @app.cell
-def _(
-    LAYERS,
-    W0,
-    astra_bits,
-    bf16_to_f32,
-    build_bits,
-    fam,
-    fam_n,
-    json,
-    make_spec,
-    mo,
-    n_changed,
-    np,
-):
-    my_spec = make_spec(fam.value, int(fam_n.value))
-    my_bits = build_bits(my_spec)
-    _full = sum(np.abs(bf16_to_f32(astra_bits[L]) - W0[L]).sum() for L in LAYERS)
-    _mine = sum(np.abs(bf16_to_f32(my_bits[L]) - W0[L]).sum() for L in LAYERS)
-    _txt = json.dumps(my_spec)
-    mo.md(f"**{n_changed(my_bits):,}** changed bf16 entries ({100 * n_changed(my_bits) / n_changed(astra_bits):.1f}% of Astra's edit), "
-          f"carrying **{100 * _mine / _full:.1f}%** of its |Δ| mass.<br>"
-          f"<details><summary>spec ({len(_txt):,} chars)</summary>\n\n```json\n{_txt[:3000]}{' …' if len(_txt) > 3000 else ''}\n```\n</details>")
+def _(LAYERS, W0, astra_bits, bf16_to_f32, build_bits, make_spec, mo, n_changed, np):
+    my_spec = make_spec("D", 4096)  # family, size
+    _bits = build_bits(my_spec)
+    _mass = sum(np.abs(bf16_to_f32(_bits[L]) - W0[L]).sum() for L in LAYERS) / sum(np.abs(bf16_to_f32(astra_bits[L]) - W0[L]).sum() for L in LAYERS)
+    mo.md(f"{n_changed(_bits):,} changed entries ({100 * n_changed(_bits) / n_changed(astra_bits):.1f}% of Astra's edit), carrying {100 * _mass:.1f}% of its |Δ| mass")
     return (my_spec,)
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 2.4 Analyze the screening runs
+
+    `data/screens/` holds one row per problem per candidate: correct or not, why generation stopped, tokens used.
+    Each candidate is paired with the full edit (`A64_topk64`) on the same 256 problems.
+    """)
+    return
+
+
 @app.cell
-def _(ROOT, json, math, np):
+def _(ROOT, json, math, mo, np):
     screens = {}
     for _p in sorted((ROOT / "data" / "screens").glob("screen_*.jsonl")):
         screens[_p.stem[len("screen_"):]] = {r["id"]: r for r in map(json.loads, open(_p))}
-    screens = {k: v for k, v in screens.items() if k not in ("ONE_L15E32", "ENERGY_16")}  # invalidated recipes
 
 
     def acc(cid):
@@ -973,7 +950,7 @@ def _(ROOT, json, math, np):
 
 
     def paired(a, b, n_boot=4000, seed=0):
-        """a vs b on the same problems: diff, discordant counts, exact McNemar p, bootstrap 95% CI."""
+        """a vs b on the same problems: accuracy difference, discordant counts, exact McNemar p, bootstrap 95% CI."""
         ids = sorted(set(screens[a]) & set(screens[b]))
         x = np.array([screens[a][i]["correct"][0] for i in ids])
         y = np.array([screens[b][i]["correct"][0] for i in ids])
@@ -984,226 +961,192 @@ def _(ROOT, json, math, np):
         boot = np.random.default_rng(seed).choice(d, (n_boot, len(d))).mean(1)
         return {"diff": d.mean(), "a_only": n10, "b_only": n01, "p": p, "ci": tuple(np.percentile(boot, [2.5, 97.5])), "n": len(ids)}
 
+
+    mo.md(f"{len(screens)} screens loaded: {', '.join(sorted(screens))}")
     return acc, paired, screens
 
 
 @app.cell
-def _(acc, entry_counts, mo, np, paired, screens):
-    screen_rows = []
-    for _cid in sorted(screens, key=lambda c: entry_counts.get(c, 0)):
-        _r = list(screens[_cid].values())
-        _vA, _vB = paired(_cid, "A64_topk64"), paired(_cid, "G000_scale")
-        screen_rows.append({
-            "candidate": _cid, "entries": entry_counts.get(_cid, "—"), "acc": f"{100 * acc(_cid):.1f}%",
-            "cut at 32k": f"{100 * np.mean([x['finish'][0] == 'length' for x in _r]):.0f}%",
-            "Δ vs full edit": f"{100 * _vA['diff']:+.1f}pp",
-            "95% CI": f"{100 * _vA['ci'][0]:+.1f} to {100 * _vA['ci'][1]:+.1f}",
-            "p": f"{_vA['p']:.2g}",
-            "Δ vs base": f"{100 * _vB['diff']:+.1f}pp",
-        })
-    mo.vstack([mo.md("### 2.4 Screening results, recomputed from the raw per-problem outputs\n\n"
-                     "`data/screens/*.jsonl` hold one row per problem per candidate (correct, finish reason, tokens). "
-                     "Each candidate is paired with the full edit (`A64_topk64`) on the same 256 problems: difference in accuracy, "
-                     "95% bootstrap CI, exact McNemar p. `G000_scale` is the unedited base."),
-               mo.ui.table(screen_rows, selection=None, pagination=False, page_size=30)])
-    return
+def _(acc, entry_counts, np, paired, pd, screens):
+    _family = {"A": "A · top-k neurons", "D": "D · top-B entries", "ER": "ER · layer-15 rows", "B": "B · one layer", "G": "unedited base"}
+    _rows = []
+    for _c in screens:
+        _p = paired(_c, "A64_topk64")
+        _rows.append({"candidate": _c, "family": next(v for k, v in _family.items() if _c.startswith(k)),
+                      "changed entries": entry_counts.get(_c, 0), "accuracy (%)": round(100 * acc(_c), 1),
+                      "vs full edit (pp)": round(100 * _p["diff"], 1),
+                      "95% CI": f"{100 * _p['ci'][0]:+.1f} to {100 * _p['ci'][1]:+.1f}", "McNemar p": float(f"{_p['p']:.2g}"),
+                      "cut at 32k (%)": round(100 * np.mean([x["finish"][0] == "length" for x in screens[_c].values()]))})
+    screen_table = pd.DataFrame(_rows).sort_values("changed entries")
+    screen_table
+    return (screen_table,)
 
 
 @app.cell
-def _(GREY, PALETTE, acc, entry_counts, mo, plt, screens):
-    _fams = {"A": ("o", PALETTE["blue"], "A · top-k columns"), "D": ("s", PALETTE["orange"], "D · top-B entries"),
-             "ER": ("^", PALETTE["green"], "ER · L15 rows"), "B": ("D", PALETTE["purple"], "B · one layer")}
-    _fig, _ax = plt.subplots(figsize=(8, 4))
-    for _k, (_m, _c, _lab) in _fams.items():
-        _pts = sorted((entry_counts[c], 100 * acc(c)) for c in screens if c.startswith(_k) and c in entry_counts)
-        _pts = [p for p in _pts if p[0] > 0]
-        if _k == "A":
-            _ax.plot(*zip(*_pts), "-", color=_c, linewidth=0.8, alpha=0.6)
-        _ax.scatter(*zip(*_pts), marker=_m, color=_c, s=26, label=_lab, zorder=3)
-    _ax.axhline(100 * acc("A64_topk64"), color=PALETTE["blue"], linestyle=":", linewidth=0.9)
-    _ax.axhline(100 * acc("G000_scale"), color=GREY, linestyle=":", linewidth=0.9)
-    _ax.text(1.0, 100 * acc("G000_scale") + 0.8, "unedited base", color=GREY, ha="right", transform=_ax.get_yaxis_transform())
-    _ax.text(1.0, 100 * acc("A64_topk64") + 0.8, "Astra's full edit", color=PALETTE["blue"], ha="right", transform=_ax.get_yaxis_transform())
-    _ax.set_xscale("log")
-    _ax.set_xlabel("changed bf16 entries (built in §2.2)")
-    _ax.set_ylabel("MATH-train screening accuracy (%)")
-    _ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), frameon=False)
-    _fig.tight_layout()
-    mo.vstack([_fig, mo.md("Choosing **entries** by |Δ| (D) beats choosing whole **columns** (A): D4k — 8,192 entries, 6% of the edit — ties the full edit, "
-                           "while A needs ~48 columns/layer (~98k entries) to get within noise. Single-sample screening on 256 problems: differences under ~5pp are noise.")])
-    return
+def _(mo, screen_table, screens):
+    PICK = mo.ui.dropdown(list(screen_table["candidate"]), value="D4k_entries", label="candidate")
+    AGAINST = mo.ui.dropdown(sorted(screens), value="A64_topk64", label="against")
+    mo.hstack([PICK, AGAINST], justify="start")
+    return AGAINST, PICK
 
 
 @app.cell
-def _(mo, screens):
-    pa = mo.ui.dropdown(sorted(screens), value="D4k_entries", label="candidate")
-    pb = mo.ui.dropdown(sorted(screens), value="A64_topk64", label="against")
-    mo.hstack([pa, pb], justify="start")
-    return pa, pb
-
-
-@app.cell
-def _(mo, pa, paired, pb):
-    _r = paired(pa.value, pb.value)
-    mo.md(f"**{pa.value} − {pb.value}** on {_r['n']} paired problems: **{100*_r['diff']:+.1f}pp** "
-          f"(95% CI {100*_r['ci'][0]:+.1f} to {100*_r['ci'][1]:+.1f}); solved only by {pa.value}: {_r['a_only']}, only by {pb.value}: {_r['b_only']}; "
-          f"exact McNemar p = {_r['p']:.3g}.")
-    return
-
-
-@app.cell
-def _(EX, json, mo, np):
-    _rows = [json.loads(l) for l in open(EX / "validate_D4k_math500.jsonl")]
-    _c = np.array([r["correct"] for r in _rows], float)
-    mo.md(f"### 2.5 Held-out check (partial)\n\nD4k on MATH-500 × 4 samples (full 32k protocol, GPU): **{int(_c.sum()):,}/{_c.size:,} = {100*_c.mean():.1f}%**, "
-          f"vs 48.1% for the full edit in the published evaluation. The A64 arm of this validation and the GSM8K/IFEval arms did not finish, "
-          "so this is not a paired comparison.")
-    return
-
-
-@app.cell
-def _(mo):
-    import torch
-
-    DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    load_model_btn = mo.ui.run_button(label="▶ load Qwen3.5-0.8B (downloads ~1.7 GB once)")
+def _(PALETTE, PICK, acc, alt, mo, screen_table):
+    _fams = ["A · top-k neurons", "D · top-B entries", "ER · layer-15 rows", "B · one layer"]
+    _hl = alt.datum.candidate == PICK.value
     mo.vstack([
-        mo.md(f"""### 2.6 Run the model on this machine
-
-    Paired generations, base vs a candidate, on the screening problems, with the campaign's chat template, thinking on,
-    and sampling (temp 0.6, top-p 0.95, top-k 20). Weights are loaded once in fp32 (exact for bf16 values) and the
-    two `down_proj` tensors are swapped per arm. Device found on this machine: **{DEVICE}**{' — CPU runs at ~0.5 tok/s, too slow; use a Mac with Apple GPU or CUDA' if DEVICE == 'cpu' else ''}.
-
-    **What to expect.** On an M-series Mac, 8 problems × 1,024 tokens × 2 arms takes ~1.5 min, and 4 × 4,096 takes ~4.5 min.
-    The edit's effect does **not** show at these budgets: both arms are still thinking when they are cut off. It shows
-    at the campaign's 32k cap, where the base runs out of tokens on 91% of problems and the full edit on 30%.
-    The table therefore also shows each problem's recorded 32k-token screening result. Use this section to read and
-    compare what the edited model writes. For the full-budget replication, use a GPU server (§2.7)."""),
-        load_model_btn,
+        alt.Chart(screen_table[screen_table["changed entries"] > 0]).mark_point(filled=True).encode(
+            x=alt.X("changed entries:Q", scale=alt.Scale(type="log", domain=[1500, 200000]), title="changed bf16 entries"),
+            y=alt.Y("accuracy (%):Q", scale=alt.Scale(domain=[20, 62]), title="MATH-train screening accuracy (%)"),
+            color=alt.Color("family:N", scale=alt.Scale(domain=_fams, range=[PALETTE["blue"], PALETTE["orange"], PALETTE["green"], PALETTE["purple"]]),
+                            legend=alt.Legend(orient="bottom", title=None, columns=2)),
+            shape=alt.Shape("family:N", scale=alt.Scale(domain=_fams, range=["circle", "square", "triangle-up", "diamond"]), legend=None),
+            size=alt.condition(_hl, alt.value(260), alt.value(80)),
+            stroke=alt.condition(_hl, alt.value("black"), alt.value(None)),
+            tooltip=["candidate", "family", alt.Tooltip("changed entries:Q", format=","), "accuracy (%)", "vs full edit (pp)", "95% CI", "McNemar p", "cut at 32k (%)"],
+        ).properties(width=500, height=320),
+        mo.md(f"Choosing **entries** by |Δ| (D) beats choosing whole **neurons** (A): D4k — 8,192 entries, 6% of the edit — ties the full edit "
+              f"({100 * acc('A64_topk64'):.1f}%, the right-most point), while A needs ~48 neurons per layer (~98k entries) to get within noise. "
+              f"Unedited base: {100 * acc('G000_scale'):.1f}%. With one sample on 256 problems, differences under ~5pp are noise. "
+              "Hover a point for its numbers; the outlined point is the candidate picked above."),
     ])
-    return DEVICE, load_model_btn, torch
+    return
 
 
 @app.cell
-def _(DEVICE, LAYERS, W0, load_model_btn, mo, np, torch):
-    qwen = tok = qwen_path = None
-    if load_model_btn.value:
-        from huggingface_hub import snapshot_download
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from transformers.utils import logging as _hf_logging
+def _(AGAINST, PALETTE, PICK, alt, mo, paired, pd, screens):
+    _a, _b = PICK.value, AGAINST.value
+    _r = paired(_a, _b)
+    _cats = {(1, 1): "both solved", (1, 0): f"only {_a}", (0, 1): f"only {_b}", (0, 0): "neither"}
+    _ids = sorted(set(screens[_a]) & set(screens[_b]))
+    _df = pd.DataFrame([{"problem": i.removeprefix("math_train_"), "col": k % 32, "row": k // 32,
+                         "outcome": _cats[(screens[_a][i]["correct"][0], screens[_b][i]["correct"][0])],
+                         f"{_a} tokens": screens[_a][i]["n_tokens"][0], f"{_b} tokens": screens[_b][i]["n_tokens"][0]}
+                        for k, i in enumerate(_ids)])
+    mo.vstack([
+        mo.md(f"**{_a} − {_b}** on {_r['n']} problems: **{100 * _r['diff']:+.1f}pp** (95% CI {100 * _r['ci'][0]:+.1f} to {100 * _r['ci'][1]:+.1f}); "
+              f"solved only by {_a}: {_r['a_only']}, only by {_b}: {_r['b_only']}; exact McNemar p = {_r['p']:.3g}. One square per problem; hover for details."),
+        alt.Chart(_df).mark_rect(stroke="white", strokeWidth=1).encode(
+            x=alt.X("col:O", axis=None), y=alt.Y("row:O", axis=None),
+            color=alt.Color("outcome:N", title=None, scale=alt.Scale(domain=list(_cats.values()),
+                            range=[PALETTE["green"], PALETTE["blue"], PALETTE["orange"], "#dddddd"]), legend=alt.Legend(orient="bottom", columns=4)),
+            tooltip=["problem", "outcome", f"{_a} tokens", f"{_b} tokens"],
+        ).properties(width=500, height=130),
+    ])
+    return
 
-        _hf_logging.set_verbosity_error()  # Qwen3.5 warns about optional CUDA kernels on every forward pass
 
-        with mo.status.spinner("downloading / loading Qwen3.5-0.8B"):
-            # public model; token=False so a stale token on the viewer's machine can't break the download
-            qwen_path = snapshot_download("Qwen/Qwen3.5-0.8B", revision="2fc06364715b967f1860aea9cf38778875588b17", token=False)
-            tok = AutoTokenizer.from_pretrained(qwen_path, padding_side="left")
-            qwen = AutoModelForCausalLM.from_pretrained(qwen_path, dtype=torch.float32).to(DEVICE).eval()
-        for _L in LAYERS:
-            assert np.array_equal(qwen.model.layers[_L].mlp.down_proj.weight.detach().cpu().numpy(), W0[_L].astype(np.float32)), "base tensors differ from data/exp8"
-    mo.md(f"Loaded `{type(qwen).__name__}` on **{DEVICE}**; layers 15/19 `down_proj` match the bundled base tensors bit-for-bit."
-          if qwen is not None else "_Model not loaded._")
-    return qwen, qwen_path, tok
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 2.5 Run the model yourself
+
+    Paired generations, unedited base vs a candidate, on the first screening problems, with the campaign's chat template,
+    thinking on, and sampling (temp 0.6, top-p 0.95, top-k 20). Needs an Apple-silicon GPU or CUDA (CPU runs at ~0.5
+    tokens/s) and downloads Qwen3.5-0.8B (~1.7 GB) once. On an M-series Mac, 8 problems × 1,024 tokens takes ~1.5 min.
+
+    **What to expect.** At laptop budgets both versions are still thinking when they are cut off, so accuracy barely
+    moves. The edit's effect shows at the campaign's 32k cap (base cut off on 91% of problems, full edit 30%), so the
+    table also shows each problem's recorded 32k screening. Until you run it, the table shows a bundled example run.
+    """)
+    return
 
 
 @app.cell
-def _(CAMPAIGN_SPECS, EX, json, mo):
-    gen_arm = mo.ui.dropdown(["my design (§2.3)"] + sorted(CAMPAIGN_SPECS), value="A64_topk64", label="candidate (vs unedited base)")
-    gen_n = mo.ui.slider(2, 32, value=8, step=2, label="problems", show_value=True)
-    gen_tokens = mo.ui.dropdown(["512", "1024", "2048", "4096"], value="1024", label="max new tokens")
-    gen_run = mo.ui.run_button(label="▶ generate")
-    # a run made with this cell on an Apple M-series GPU, shown until you make your own
-    _ex = EX / "example_generations.json"
-    EXAMPLE_GEN = json.load(open(_ex)) if _ex.exists() else None
-    get_gen, set_gen = mo.state(None)
-    mo.hstack([gen_arm, gen_n, gen_tokens, gen_run], justify="start")
-    return EXAMPLE_GEN, gen_arm, gen_n, gen_run, gen_tokens, get_gen, set_gen
+def _():
+    RUN_QWEN = False  # set True and run this cell to generate on this machine
+    GENERATE = {"candidate": "A64_topk64", "problems": 8, "max_new_tokens": 1024}  # candidate: a campaign id or "my_spec"
+    return GENERATE, RUN_QWEN
 
 
 @app.cell
 def _(
     CAMPAIGN_SPECS,
     EX,
+    GENERATE,
     LAYERS,
     ROOT,
+    RUN_QWEN,
+    W0,
     bf16_to_f32,
     build_bits,
-    gen_arm,
-    gen_n,
-    gen_run,
-    gen_tokens,
     json,
     mo,
     my_spec,
-    qwen,
-    set_gen,
+    np,
     time,
-    tok,
-    torch,
 ):
-    mo.stop(not gen_run.value, mo.md("_Press **generate** to run it on this machine._"))
-    mo.stop(qwen is None, mo.md("_Load the model first (button above)._"))
-    from math_verify import parse, verify
+    if RUN_QWEN:
+        import torch
+        from huggingface_hub import snapshot_download
+        from math_verify import parse, verify
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers.utils import logging as _hf_logging
 
-    _INSTR = "Please reason step by step, and put your final answer within \\boxed{}."
-    _probs = [json.loads(l) for l in open(EX / "screening_256.jsonl")][: gen_n.value]
-    _prompts = [tok.apply_chat_template([{"role": "user", "content": p["problem"] + "\n" + _INSTR}], tokenize=False,
-                                        add_generation_prompt=True, enable_thinking=True) for p in _probs]
-    _T = int(gen_tokens.value)
-    _spec = my_spec if gen_arm.value.startswith("my design") else CAMPAIGN_SPECS[gen_arm.value]
-    _pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        _hf_logging.set_verbosity_error()  # Qwen3.5 warns about optional CUDA kernels on every forward pass
+        _device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        with mo.status.spinner("downloading / loading Qwen3.5-0.8B"):
+            # public model; token=False so a stale token on the viewer's machine can't break the download
+            _path = snapshot_download("Qwen/Qwen3.5-0.8B", revision="2fc06364715b967f1860aea9cf38778875588b17", token=False)
+            _tok = AutoTokenizer.from_pretrained(_path, padding_side="left")
+            _qwen = AutoModelForCausalLM.from_pretrained(_path, dtype=torch.float32).to(_device).eval()
+        for _L in LAYERS:
+            assert np.array_equal(_qwen.model.layers[_L].mlp.down_proj.weight.detach().cpu().numpy(), W0[_L].astype(np.float32)), "base tensors differ from data/exp8"
 
-
-    def _loop_share(ids, w=16):
-        seen, rep = set(), 0
-        for i in range(len(ids) - w + 1):
-            g = tuple(ids[i:i + w])
-            rep += g in seen
-            seen.add(g)
-        return rep / max(len(ids) - w + 1, 1)
-
-
-    def _run_arm(bits):
-        with torch.no_grad():
-            for L in LAYERS:
-                qwen.model.layers[L].mlp.down_proj.weight.copy_(torch.from_numpy(bf16_to_f32(bits[L])))
-            torch.manual_seed(0)
-            enc = tok(_prompts, return_tensors="pt", padding=True).to(qwen.device)
-            out = qwen.generate(**enc, max_new_tokens=_T, do_sample=True, temperature=0.6, top_p=0.95, top_k=20, pad_token_id=_pad)
-        res = []
-        for p, row in zip(_probs, out[:, enc["input_ids"].shape[1]:].cpu().tolist()):
-            ids = [t for t in row if t != _pad]
-            text = tok.decode(ids, skip_special_tokens=True)
-            try:
-                ok = bool(verify(parse(f"${p['answer']}$"), parse(text)))
-            except Exception:  # math-verify raises on unparsable answers; that is a wrong answer
-                ok = False
-            res.append({"correct": ok, "cut": len(ids) >= _T, "tokens": len(ids), "loop": _loop_share(ids), "text": text})
-        return res
+        _probs = [json.loads(l) for l in open(EX / "screening_256.jsonl")][: GENERATE["problems"]]
+        _prompts = [_tok.apply_chat_template([{"role": "user", "content": p["problem"] + "\nPlease reason step by step, and put your final answer within \\boxed{}."}],
+                                             tokenize=False, add_generation_prompt=True, enable_thinking=True) for p in _probs]
+        _T = GENERATE["max_new_tokens"]
+        _pad = _tok.pad_token_id if _tok.pad_token_id is not None else _tok.eos_token_id
 
 
-    _t0 = time.time()
-    _arms = {}
-    for _name, _bits in mo.status.progress_bar([("base", build_bits({"scale": 0.0})), (gen_arm.value, build_bits(_spec))], title="generating"):
-        _arms[_name] = _run_arm(_bits)
-    _run = {"candidate": gen_arm.value, "max_new_tokens": _T, "problems": [p["id"] for p in _probs],
-            "answers": [p["answer"] for p in _probs], "device": str(qwen.device), "wall_s": round(time.time() - _t0),
-            "arms": _arms}
-    _out = ROOT / "runs" / f"generations_{gen_arm.value.split(' ')[0]}_{len(_probs)}x{_T}.json"
-    _out.parent.mkdir(exist_ok=True)
-    _out.write_text(json.dumps(_run))
-    set_gen(_run)
-    mo.md(f"_Done in {_run['wall_s']} s; saved to `runs/{_out.name}`._")
-    return
+        def _loop_share(ids, w=16):
+            seen, rep = set(), 0
+            for i in range(len(ids) - w + 1):
+                g = tuple(ids[i:i + w])
+                rep += g in seen
+                seen.add(g)
+            return rep / max(len(ids) - w + 1, 1)
+
+
+        def _generate(bits):
+            with torch.no_grad():
+                for L in LAYERS:
+                    _qwen.model.layers[L].mlp.down_proj.weight.copy_(torch.from_numpy(bf16_to_f32(bits[L])))
+                torch.manual_seed(0)
+                enc = _tok(_prompts, return_tensors="pt", padding=True).to(_qwen.device)
+                out = _qwen.generate(**enc, max_new_tokens=_T, do_sample=True, temperature=0.6, top_p=0.95, top_k=20, pad_token_id=_pad)
+            res = []
+            for p, row in zip(_probs, out[:, enc["input_ids"].shape[1]:].cpu().tolist()):
+                ids = [t for t in row if t != _pad]
+                text = _tok.decode(ids, skip_special_tokens=True)
+                try:
+                    ok = bool(verify(parse(f"${p['answer']}$"), parse(text)))
+                except Exception:  # math-verify raises on unparsable answers; that is a wrong answer
+                    ok = False
+                res.append({"correct": ok, "cut": len(ids) >= _T, "tokens": len(ids), "loop": _loop_share(ids), "text": text})
+            return res
+
+
+        _cand = GENERATE["candidate"]
+        _t0 = time.time()
+        _arms = {}
+        for _name, _spec in mo.status.progress_bar([("base", {"scale": 0.0}), (_cand, my_spec if _cand == "my_spec" else CAMPAIGN_SPECS[_cand])], title="generating"):
+            _arms[_name] = _generate(build_bits(_spec))
+        generations = {"candidate": _cand, "max_new_tokens": _T, "problems": [p["id"] for p in _probs], "device": _device,
+                       "wall_s": round(time.time() - _t0), "arms": _arms, "source": "this machine"}
+        (ROOT / "runs").mkdir(exist_ok=True)
+        (ROOT / "runs" / f"generations_{_cand}_{len(_probs)}x{_T}.json").write_text(json.dumps(generations))
+    else:
+        generations = json.load(open(EX / "example_generations.json")) | {"source": "bundled example (Apple-silicon Mac)"}
+    mo.md(f"{generations['source']}: {len(generations['problems'])} problems × {generations['max_new_tokens']:,} tokens, {generations['wall_s']} s")
+    return (generations,)
 
 
 @app.cell
-def _(EXAMPLE_GEN, get_gen, mo, np, screens):
-    gen_view = get_gen() or EXAMPLE_GEN
-    mo.stop(gen_view is None, mo.md("_No generations yet. Load the model and press **generate**._"))
-    _T = gen_view["max_new_tokens"]
-    _cand = gen_view["candidate"]
-    _b, _c = gen_view["arms"]["base"], gen_view["arms"][_cand]
+def _(generations, mo, np, screens):
+    _T, _cand = generations["max_new_tokens"], generations["candidate"]
+    _b, _c = generations["arms"]["base"], generations["arms"][_cand]
 
 
     def _rec(cid, pid):
@@ -1211,101 +1154,93 @@ def _(EXAMPLE_GEN, get_gen, mo, np, screens):
         return "—" if r is None else f"{'✓' if r['correct'][0] else '✗'} {r['n_tokens'][0]:,} tok{' (cut)' if r['finish'][0] == 'length' else ''}"
 
 
-    def _summ(r):
-        return (f"{sum(x['correct'] for x in r)}/{len(r)} correct · {sum(x['cut'] for x in r)}/{len(r)} hit the {_T:,}-token cap · "
-                f"mean repeated-16-gram share {100 * np.mean([x['loop'] for x in r]):.0f}%")
+    def _arm(x):
+        return ("✓" if x["correct"] else "✗") + (" cut" if x["cut"] else "") + f" · loop {100 * x['loop']:.0f}%"
 
 
-    _rows = [{"problem": pid.removeprefix("math_train_"),
-              "base": ("✓" if b["correct"] else "✗") + (" cut" if b["cut"] else "") + f" · loop {100 * b['loop']:.0f}%",
-              _cand: ("✓" if c["correct"] else "✗") + (" cut" if c["cut"] else "") + f" · loop {100 * c['loop']:.0f}%",
-              "base @ 32k": _rec("G000_scale", pid), f"{_cand} @ 32k": _rec(_cand, pid)}
-             for pid, ans, b, c in zip(gen_view["problems"], gen_view["answers"], _b, _c)]
+    def _summary(r):
+        return (f"{sum(x['correct'] for x in r)}/{len(r)} correct · {sum(x['cut'] for x in r)}/{len(r)} cut at {_T:,} tokens · "
+                f"repeated-16-gram share {100 * np.mean([x['loop'] for x in r]):.0f}%")
+
+
     mo.vstack([
-        mo.md(("_Your run on this machine._" if get_gen() else
-               f"_Bundled example run (Apple-silicon Mac GPU, {gen_view['wall_s']} s). Press **generate** to make your own._")
-              + f"<br>**base:** {_summ(_b)}<br>**{_cand}:** {_summ(_c)}<br>"
-              f"At a {_T:,}-token cap most thinking traces are cut in both arms. The \"@ 32k\" columns are the campaign's recorded screening of the same problems at its 32k cap."),
-        mo.ui.table(_rows, selection=None, pagination=False),
+        mo.md(f"**base:** {_summary(_b)}<br>**{_cand}:** {_summary(_c)}"),
+        mo.ui.table([{"problem": pid.removeprefix("math_train_"), "base": _arm(b), _cand: _arm(c),
+                      "base @ 32k (screen)": _rec("G000_scale", pid), f"{_cand} @ 32k (screen)": _rec(_cand, pid)}
+                     for pid, b, c in zip(generations["problems"], _b, _c)], selection=None, pagination=False),
     ])
-    return (gen_view,)
+    return
 
 
 @app.cell
-def _(gen_view, mo):
-    _names = list(gen_view["arms"])
-    peek_arm = mo.ui.dropdown(_names, value=_names[-1], label="arm")
-    peek_i = mo.ui.dropdown({f"{i}: {p}": i for i, p in enumerate(gen_view["problems"])}, value=f"0: {gen_view['problems'][0]}", label="problem")
-    mo.vstack([mo.md("**Read a generation** (last 3,000 characters)"), mo.hstack([peek_arm, peek_i], justify="start")])
-    return peek_arm, peek_i
+def _(generations, mo):
+    READ = mo.ui.dropdown({f"{arm}: problem {i}": (arm, i) for arm in generations["arms"] for i in range(len(generations["problems"]))},
+                          value=f"{generations['candidate']}: problem 0", label="read a generation")
+    READ
+    return (READ,)
 
 
 @app.cell
-def _(gen_view, mo, peek_arm, peek_i):
+def _(READ, generations, mo):
     import html
-    _r = gen_view["arms"][peek_arm.value][peek_i.value]
+
+    _arm, _i = READ.value
+    _r = generations["arms"][_arm][_i]
     mo.vstack([
         mo.md(f"{_r['tokens']:,} tokens · repeated-16-gram share {100 * _r['loop']:.0f}% · {'correct' if _r['correct'] else 'not correct'}"
-              f"{' · cut at the token cap' if _r['cut'] else ''}"),
-        mo.Html("<pre style='white-space: pre-wrap; font-size: 12px; max-height: 420px; overflow: auto'>…"
-                + html.escape(_r["text"][-3000:]) + "</pre>"),
+              f"{' · cut at the token cap' if _r['cut'] else ''} · last 3,000 characters:"),
+        mo.Html("<pre style='white-space: pre-wrap; font-size: 12px; max-height: 420px; overflow: auto'>…" + html.escape(_r["text"][-3000:]) + "</pre>"),
     ])
     return
 
 
-@app.cell
-def _(CAMPAIGN_SPECS, mo):
-    ck_arm = mo.ui.dropdown(["my design (§2.3)"] + sorted(CAMPAIGN_SPECS), value="D4k_entries", label="candidate")
-    ck_btn = mo.ui.run_button(label="▶ write checkpoint")
-    mo.vstack([mo.md("### 2.7 Full-protocol replication on a GPU\n\nWrites base Qwen3.5-0.8B with the candidate's two tensors swapped in "
-                     "(`checkpoints/<name>/`, ~1.7 GB, needs the model from §2.6), then gives the exact screening command the campaign ran."),
-               mo.hstack([ck_arm, ck_btn], justify="start")])
-    return ck_arm, ck_btn
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### 2.6 Replicate a screen at full budget (GPU)
 
-
-@app.cell
-def _(
-    CAMPAIGN_SPECS,
-    LAYERS,
-    ROOT,
-    build_bits,
-    ck_arm,
-    ck_btn,
-    json,
-    mo,
-    my_spec,
-    qwen_path,
-):
-    mo.stop(not ck_btn.value, mo.md("_Press **write checkpoint**._"))
-    mo.stop(qwen_path is None, mo.md("_Load the model in §2.6 first; the checkpoint is built from its files._"))
-    import os
-
-    import st_numpy
-
-    _name = "my_design" if ck_arm.value.startswith("my design") else ck_arm.value
-    _spec = my_spec if _name == "my_design" else CAMPAIGN_SPECS[_name]
-    _out = ROOT / "checkpoints" / _name
-    _out.mkdir(parents=True, exist_ok=True)
-    (_out / "candidate_spec.json").write_text(json.dumps(_spec))
-    _st = next(f for f in os.listdir(qwen_path) if f.endswith(".safetensors"))
-    for _f in os.listdir(qwen_path):
-        if _f != _st and not (_out / _f).exists():
-            os.symlink(os.path.join(qwen_path, _f), _out / _f)
-    with mo.status.spinner("writing safetensors"):
-        _tensors = st_numpy.load(os.path.join(qwen_path, _st))
-        _bits = build_bits(_spec)
-        for _L in LAYERS:
-            _tensors[f"model.language_model.layers.{_L}.mlp.down_proj.weight"] = ("BF16", _bits[_L])
-        st_numpy.save(str(_out / _st), _tensors, {"format": "pt"})
-    mo.md(f"Wrote `checkpoints/{_name}/`. Copy this folder to a CUDA machine with `vllm` and `math-verify`, and from it run:\n\n```sh\n"
-          f"python code/eval_vllm.py --model checkpoints/{_name} --problems data/exp8/screening_256.jsonl \\\n"
-          f"    --out data/screens/screen_{_name}.jsonl --n 1 --max-tokens 32768 --gpu-mem 0.85\n```\n"
-          "The output lands next to the other screens, so §2.4 includes it in the paired analysis on the next run. "
-          "The checkpoint's other files are symlinks into the Hugging Face cache; copy with `cp -L` to resolve them.")
+    Set `CHECKPOINT` to a candidate id (or `"my_spec"`) and run the cell. It writes base Qwen3.5-0.8B with the
+    candidate's two tensors swapped in to `checkpoints/<name>/` (~1.7 GB) and prints the campaign's screening command.
+    """)
     return
 
 
 @app.cell
+def _(CAMPAIGN_SPECS, LAYERS, ROOT, build_bits, json, mo, my_spec):
+    CHECKPOINT = None  # e.g. "D4k_entries" or "my_spec"
+
+    if CHECKPOINT is None:
+        _out = mo.md("_Set `CHECKPOINT` to write one._")
+    else:
+        import os
+
+        import st_numpy
+        from huggingface_hub import snapshot_download as _snapshot
+
+        _spec = my_spec if CHECKPOINT == "my_spec" else CAMPAIGN_SPECS[CHECKPOINT]
+        _qwen_path = _snapshot("Qwen/Qwen3.5-0.8B", revision="2fc06364715b967f1860aea9cf38778875588b17", token=False)
+        _dir = ROOT / "checkpoints" / CHECKPOINT
+        _dir.mkdir(parents=True, exist_ok=True)
+        (_dir / "candidate_spec.json").write_text(json.dumps(_spec))
+        _st = next(f for f in os.listdir(_qwen_path) if f.endswith(".safetensors"))
+        for _f in os.listdir(_qwen_path):
+            if _f != _st and not (_dir / _f).exists():
+                os.symlink(os.path.join(_qwen_path, _f), _dir / _f)
+        with mo.status.spinner("writing safetensors"):
+            _tensors = st_numpy.load(os.path.join(_qwen_path, _st))
+            _bits = build_bits(_spec)
+            for _L in LAYERS:
+                _tensors[f"model.language_model.layers.{_L}.mlp.down_proj.weight"] = ("BF16", _bits[_L])
+            st_numpy.save(str(_dir / _st), _tensors, {"format": "pt"})
+        _out = mo.md(f"Wrote `checkpoints/{CHECKPOINT}/`. Copy the folder (`cp -L` resolves its symlinks into the Hugging Face cache) to a CUDA machine "
+                     f"with `vllm` and `math-verify`, and from the repo run:\n\n```sh\npython code/eval_vllm.py --model checkpoints/{CHECKPOINT} "
+                     f"--problems data/exp8/screening_256.jsonl \\\n    --out data/screens/screen_{CHECKPOINT}.jsonl --n 1 --max-tokens 32768 --gpu-mem 0.85\n```\n"
+                     "The result lands next to the other screens, so §2.4 includes it on the next run.")
+    _out
+    return
+
+
+@app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
     ---
@@ -1315,14 +1250,15 @@ def _(mo):
     |:--|:--|:--|
     | Astra's edit | 6,073 entries | 130,188 bf16 entries |
     | What it is | ~55 functional writes + 6,018 erasures isolating repurposed units | one direction subtracted through 64 chosen MLP neurons in each of 2 layers |
-    | Smallest subset of Astra's edit that keeps the behavior | **12 entries** (§1.4–1.5), 11 if one redundant entry goes | **8,192 entries** (D4k, §2.4) — ties the full edit in screening |
-    | Written from scratch | **10 entries** (§1.1, §1.8) | — |
-    | Evidence | exact: Kinetix, 1,024 episodes × several seeds, re-runnable here | screening-grade: 256 MATH-train problems, n = 1; one partial held-out check |
+    | Smallest subset that keeps the behavior | **12 entries** (§1.4–1.5), 11 without the redundant one | **8,192 entries** (D4k, §2.4), tied with the full edit in screening |
+    | Written from scratch | **10 entries** (§1.4, §1.8) | — |
+    | Evidence | exact: Kinetix rollouts you just re-ran, matching the recorded orx runs | screening-grade: 256 MATH-train problems, one sample each; one partial held-out check |
 
-    **Caveats.** Exp 8 screening is single-sample on train problems (SE ≈ 3pp). §2.6's laptop runs use a short token
-    budget, at which the edit's effect does not show; the effect is measured at 32k tokens (§2.4). Car-ramp counts
-    are against the rounded base. The waypoint's entry set
-    is read from its checkpoint (its keep-list was not saved). Original write-ups: `data/docs/`.
+    **Caveats.** Exp 8 screening is single-sample on train problems (SE ≈ 3pp). §2.5's laptop runs use short token
+    budgets, at which the edit's effect does not show. Car-ramp entry counts are against the rounded base; the
+    waypoint's entry set is read from its checkpoint. A partial held-out check, D4k on MATH-500 × 4 samples, scored
+    54.2% (1,084/2,000; `data/exp8/validate_D4k_math500.jsonl`) against 48.1% for the full edit in the published
+    evaluation; its paired arms did not finish. Original write-ups: `data/docs/`.
     """)
     return
 

@@ -34,11 +34,11 @@ to try your own version: `EPISODES`, `TRACE_NETWORK`, `my_edit`, `my_spec`, `RUN
 
 | section | what you run | checked against |
 |---|---|---|
-| §1.2–1.3 | the base actor and Astra's 6,073-entry edit, with animations of each episode | recorded orx runs |
+| §1.2–1.3 | the base actor and Astra's 6,073-entry edit, each with an animation of one argmax episode | recorded orx runs |
 | §1.4 | the ladder: 6,073 → 1,939 → 1,718 → 12 → 11 entries, and 14 → 10 written from scratch | rebuilt networks are bit-identical to the shipped checkpoints |
-| §1.5–1.6 | drop each of the 12 entries; undo each embed column's erasures | identical success counts and episode lengths to the recorded runs at 256 episodes |
+| §1.5–1.6 | drop each of the 12 entries; undo each embed column's erasures | the recorded runs: same success counts and mean episode lengths at 256 episodes (hover a row to compare) |
 | §1.7–1.8 | trace the units the edit wires together; write and evaluate your own edit | — |
-| §2.1–2.2 | apply Astra's bf16 Qwen edit, recover its rank-1 form, rebuild the 27 campaign candidates | entry counts and specs match the campaign's |
+| §2.1–2.2 | apply Astra's bf16 Qwen edit, recover its rank-1 form, rebuild the 27 campaign candidates | the campaign's entry counts for all 27; A, D and ER specs regenerate exactly |
 | §2.3–2.4 | design a candidate; analyze the 29 raw screens (paired tests, interactive chart, per-problem grid) | the campaign's results table |
 | §2.5 | Qwen generations on your machine, base vs a candidate (`RUN_QWEN = True`; Apple GPU or CUDA) | a bundled example run until you do |
 | §2.6 | write a candidate as a checkpoint for `code/eval_vllm.py`, the campaign's 32k-token screen (CUDA) | — |

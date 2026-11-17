@@ -7,7 +7,7 @@
 #     "jax==0.9.0",
 #     "kinetix-env==3.0.2",
 #     "torch",
-#     "transformers",
+#     "transformers==5.23.0",
 #     "huggingface_hub",
 #     "math-verify",
 #     "certifi",
@@ -78,19 +78,35 @@ def _():
         import certifi
 
         dest = Path(tempfile.gettempdir()) / "weight-edit-minimization"
-        if not (dest / "data").is_dir():
+        if not (dest / ".complete").exists() and (dest / "weight-edit-minimization.py").exists() and (dest / "data").is_dir():
+            # a cache from before the marker existed; the notebook file is among the last items extracted
+            (dest / ".complete").touch()
+        if not (dest / ".complete").exists():  # written only once a download is fully extracted
             # python.org builds on macOS ship without CA certificates; use certifi's bundle
             _ctx = ssl.create_default_context(cafile=certifi.where())
             with mo.status.spinner(f"downloading the notebook's data from github.com/{REPO}"):
                 with urllib.request.urlopen(f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/main", timeout=300, context=_ctx) as _r:
                     _buf = io.BytesIO(_r.read())
-            with tarfile.open(fileobj=_buf) as _t:
-                _members = []
-                for _m in _t.getmembers():
-                    _m.name = _m.name.partition("/")[2]  # drop the "<repo>-main/" prefix
-                    if _m.name:
-                        _members.append(_m)
-                _t.extractall(dest, members=_members, filter="data")
+            import shutil
+
+            # extract into a fresh folder and switch to it only when complete; an incomplete earlier cache is set aside
+            # whole (never merged or deleted), so nothing you saved in it is lost
+            _staging = Path(tempfile.mkdtemp(dir=dest.parent, prefix="weight-edit-minimization-new-"))
+            try:
+                with tarfile.open(fileobj=_buf) as _t:
+                    _members = []
+                    for _m in _t.getmembers():
+                        _m.name = _m.name.partition("/")[2]  # drop the "<repo>-main/" prefix
+                        if _m.name:
+                            _members.append(_m)
+                    _t.extractall(_staging, members=_members, filter="data")
+                (_staging / ".complete").touch()
+            except BaseException:
+                shutil.rmtree(_staging, ignore_errors=True)  # only our own partial extraction
+                raise
+            if dest.exists():
+                dest.rename(dest.with_name(f"weight-edit-minimization-incomplete-{int(time.time())}"))
+            _staging.rename(dest)
         return dest
 
 
@@ -127,7 +143,8 @@ def _(mo):
 
     ### 1.1 Settings and the base network
 
-    Every evaluation below uses these settings. The orx runs used 256 episodes for the audits and 1,024 for the
+    Edits are made on the base weights rounded to 3 significant digits per tensor (Astra worked from that view), so
+    "entries changed" counts differences from the rounded base. Every evaluation below uses these settings. The orx runs used 256 episodes for the audits and 1,024 for the
     headline numbers; sampled episodes use the same key schedule as `eval_actor.py`, so with the same episode count
     and seed you get exactly the recorded counts.
     """)
@@ -141,7 +158,7 @@ def _():
     return EPISODES, SEED
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(CR, mo, np):
     NAME_MAP = {"embed.W": "params/Dense_0/kernel", "embed.b": "params/Dense_0/bias",
                 "actor_head.W": "params/GeneralActorCriticRNN_0/Dense_0/kernel",
@@ -162,7 +179,7 @@ def _(CR, mo, np):
 
     rounded = {k: round3(v) for k, v in base_raw.items()}
     mo.md(f"{sum(v.size for v in base_raw.values()):,} actor weights in {len(base_raw)} tensors")
-    return NAME_MAP, base_raw, rounded
+    return base_raw, rounded
 
 
 @app.cell(hide_code=True)
@@ -225,14 +242,14 @@ def _(mo, np, time):
         obs, state = _reset(reset_rng, episodes)
 
         def step(carry, _):
-            obs, state, done, rng = carry
+            obs, state, rng = carry
             logits, _ = actor_forward(W, obs.astype(jnp.float32))
             action, rng = _act(logits, rng, argmax)
             obs, state, reward, new_done, info = jax.vmap(_env.step, in_axes=(0, 0, 0, None, None))(
                 jax.random.split(rng, episodes), state, action, _env_params, None)
-            return (obs, state, done | new_done, rng), (reward, new_done, info["GoalR"])
+            return (obs, state, rng), (reward, new_done, info["GoalR"])
 
-        _, (rewards, dones, goal) = jax.lax.scan(step, (obs, state, jnp.zeros(episodes, bool), rng), None, length=256)
+        _, (rewards, dones, goal) = jax.lax.scan(step, (obs, state, rng), None, length=256)
         first = jnp.argmax(dones.astype(jnp.int32), 0)
         ar = jnp.arange(episodes)
         success = goal[first, ar]
@@ -254,7 +271,8 @@ def _(mo, np, time):
             out.update(episodes=episodes, seed=seed, argmax=argmax, success_count=int(out["success_count"]),
                        wall_s=round(time.perf_counter() - t0, 1))
             _cache[key] = out
-        return _cache[key]
+            return out
+        return _cache[key] | {"cached": True}
 
 
     @jax.jit
@@ -263,27 +281,27 @@ def _(mo, np, time):
         obs, state = _reset(reset_rng, 1)
 
         def step(carry, _):
-            obs, state, done, rng = carry
+            obs, state, rng = carry
             logits, h = actor_forward(W, obs.astype(jnp.float32))
             action, rng = _act(logits, rng, True)
-            rec = (obs[0, jnp.array([OBS_X, OBS_VX, OBS_GX])], jnp.stack(h)[:, 0], jax.nn.softmax(logits[0, :3]), action[0, 0], done[0],
-                   jax.tree.map(lambda x: x[0], state))
-            obs, state, _, new_done, info = jax.vmap(_env.step, in_axes=(0, 0, 0, None, None))(
+            before = (obs[0, jnp.array([OBS_X, OBS_VX, OBS_GX])], jnp.stack(h)[:, 0], jax.nn.softmax(logits[0, :3]), jax.tree.map(lambda x: x[0], state))
+            obs, state, _, done, info = jax.vmap(_env.step, in_axes=(0, 0, 0, None, None))(
                 jax.random.split(rng, 1), state, action, _env_params, None)
-            return (obs, state, done | new_done, rng), rec + (info["GoalR"][0],)
+            return (obs, state, rng), before + (done[0], info["GoalR"][0])
 
-        _, rec = jax.lax.scan(step, (obs, state, jnp.zeros(1, bool), rng), None, length=256)
-        return rec
+        (_, final_state, _), rec = jax.lax.scan(step, (obs, state, rng), None, length=256)
+        return rec, jax.tree.map(lambda x: x[0], final_state)
 
 
     def trace_episode(W, seed=0):
         """One argmax episode: car state (x, vx, green-x), every hidden activation, p(motor action), env states, outcome."""
-        *_arrays, states, goal = _trace({k: jnp.asarray(v, jnp.float32) for k, v in W.items()}, jax.random.PRNGKey(seed))
-        obs, h, probs, action, done = (np.asarray(a) for a in _arrays)
-        goal = np.asarray(goal)
-        n = int(np.argmax(done)) if done.any() else 256
-        return {"obs": obs[:n], "h": h[:n], "probs": probs[:n], "action": action[:n], "steps": n, "states": states,
-                "solved": bool(goal[max(n - 1, 0)]) if done.any() else False}
+        (obs, h, probs, states, done, goal), final_state = _trace({k: jnp.asarray(v, jnp.float32) for k, v in W.items()}, jax.random.PRNGKey(seed))
+        done, goal = np.asarray(done), np.asarray(goal)
+        n = int(np.argmax(done)) + 1 if done.any() else 256  # steps taken, through the first done step
+        # states[i] is the state after i steps; append the state after the last step
+        states = jax.tree.map(lambda s, f: jnp.concatenate([s, f[None]]), states, final_state)
+        return {"obs": np.asarray(obs)[:n], "h": np.asarray(h)[:n], "probs": np.asarray(probs)[:n], "steps": n, "states": states,
+                "solved": bool(done.any() and goal[n - 1])}
 
 
     from kinetix.render.renderer_pixels import make_render_pixels  # after the env import: kinetix has a circular import
@@ -292,8 +310,7 @@ def _(mo, np, time):
 
 
     def _frames(tr, stride=2, top=250):
-        # states[i] is the state after i steps, so states[steps] is the final state (capped by the 256-step scan)
-        idx = list(range(0, tr["steps"], stride)) + [min(tr["steps"], 255)]
+        idx = list(range(0, tr["steps"], stride)) + [tr["steps"]]
         frames = []
         for i in idx:
             f = np.asarray(_render(jax.tree.map(lambda x: x[i], tr["states"])))
@@ -302,7 +319,7 @@ def _(mo, np, time):
 
 
     def animate(*episodes):
-        """Animated GIF of traced episodes side by side: animate((trace, "label"), (trace, "label"), ...)."""
+        """Animated GIF of traced (argmax) episodes side by side: animate((trace, "label"), (trace, "label"), ...)."""
         import base64
         import io
 
@@ -335,7 +352,7 @@ def _(mo, np, time):
 
 
 @app.cell(hide_code=True)
-def _(PALETTE, ROOT, alt, json, mo, pd):
+def _(PALETTE, ROOT, alt, evaluate, json, mo, pd):
     import re
 
     # every RESULT line the orx runs printed, to set next to what you run here
@@ -356,41 +373,51 @@ def _(PALETTE, ROOT, alt, json, mo, pd):
     def report(name, r, rec=None):
         """One evaluation as a line of text, with the recorded orx run when there is one."""
         txt = (f"**{name}**: solved **{r['success_count']}/{r['episodes']}** · hit red {100 * r['red']:.0f}% · "
-               f"timed out {100 * r['timeout']:.0f}% · mean episode {r['mean_len']:.0f} steps · {r['wall_s']} s")
+               f"timed out {100 * r['timeout']:.0f}% · mean episode {r['mean_len']:.0f} steps · "
+               + ("same network already run above, result reused" if r.get("cached") else f"{r['wall_s']} s"))
         if rec is not None:
             same = rec["episodes"] == r["episodes"] and rec["success_count"] == r["success_count"] and round(rec["mean_len"], 3) == round(r["mean_len"], 3)
             txt += (f"<br>recorded orx run ({rec['episodes']} episodes, seed {rec['seed']}): {rec['success_count']}/{rec['episodes']}, "
-                    f"mean {rec['mean_len']:.0f} steps" + (" — **identical**" if same else ""))
+                    f"mean {rec['mean_len']:.0f} steps" + (" — **same success count and mean length**" if same else ""))
         return mo.md(txt)
 
 
-    def progress_chart(order, done, recorded_counts, title):
-        """Bars for experiments run so far (blue) next to the recorded orx result (orange tick); pending rows stay empty."""
+    def progress_chart(order, done, recorded_runs, title, current=None):
+        """Bars for runs finished so far (blue) next to the recorded orx result (orange tick); unfinished rows say so."""
         rows = []
         for name in order:
-            r = done.get(name)
-            rec = recorded_counts.get(name)
+            r, rec = done.get(name), recorded_runs.get(name)
             rows.append({"run": name, "solved (%)": None if r is None else round(100 * r["success_count"] / r["episodes"], 1),
-                         "recorded (%)": None if rec is None else round(100 * rec[0] / rec[1], 1),
-                         "label": "running…" if r is None else f"{r['success_count']}/{r['episodes']}"})
+                         "recorded (%)": None if rec is None else round(100 * rec["success_count"] / rec["episodes"], 1),
+                         "recorded": "—" if rec is None else f"{rec['success_count']}/{rec['episodes']}, mean {rec['mean_len']:.1f} steps",
+                         "label": ("running…" if name == current else "pending") if r is None else f"{r['success_count']}/{r['episodes']} · {r['mean_len']:.0f} steps"})
         df = pd.DataFrame(rows)
         y = alt.Y("run:N", sort=order, title=None, axis=alt.Axis(labelLimit=260))
-        x_scale = alt.Scale(domain=[0, 125])  # room right of 100% for the count labels
-        bars = alt.Chart(df).mark_bar(color=PALETTE["blue"]).encode(
-            x=alt.X("solved (%):Q", scale=x_scale, title="episodes solved (%)", axis=alt.Axis(values=[0, 25, 50, 75, 100])), y=y,
-            tooltip=["run", "solved (%)", "recorded (%)"])
-        ticks = alt.Chart(df).mark_tick(color=PALETTE["orange"], thickness=3, size=18).encode(x=alt.X("recorded (%):Q", scale=x_scale, title="episodes solved (%)"), y=y)
+        x_scale = alt.Scale(domain=[0, 140])  # room right of 100% for the labels
+        x = alt.X("solved (%):Q", scale=x_scale, title="episodes solved (%)", axis=alt.Axis(values=[0, 25, 50, 75, 100]))
+        bars = alt.Chart(df).mark_bar(color=PALETTE["blue"]).encode(x=x, y=y, tooltip=["run", "label", "recorded"])
+        ticks = alt.Chart(df).mark_tick(color=PALETTE["orange"], thickness=3, size=18).encode(
+            x=alt.X("recorded (%):Q", scale=x_scale, title="episodes solved (%)"), y=y, tooltip=["run", "label", "recorded"])
         pending = alt.Chart(df).transform_filter("datum['solved (%)'] === null").mark_text(align="left", dx=4, color="#888").encode(
             x=alt.XDatum(0, scale=x_scale), y=y, text="label:N")
-        labels = alt.Chart(df).transform_filter("datum['solved (%)'] !== null").mark_text(align="left", dx=8).encode(
-            x=alt.X("solved (%):Q", scale=x_scale, title="episodes solved (%)"), y=y, text="label:N")
-        n_done = sum(r is not None for r in done.values())
+        labels = alt.Chart(df).transform_filter("datum['solved (%)'] !== null").mark_text(align="left", dx=8).encode(x=x, y=y, text="label:N")
         return mo.vstack([
-            mo.md(f"**{title}** — {n_done}/{len(order)} done. Blue: this run. Orange tick: the recorded orx run."),
+            mo.md(f"**{title}** — {len(done)}/{len(order)} done. Blue: this run (solved, mean episode length). "
+                  "Orange tick: the recorded orx run; hover a row for its numbers."),
             (bars + ticks + labels + pending).properties(width=360, height=24 * len(order)),
         ])
 
-    return progress_chart, recorded_run, report
+
+    def run_with_progress(networks, recorded_runs, title, episodes, seed):
+        """Evaluate each network in turn, redrawing the progress chart after each one."""
+        results = {}
+        for name, W in networks.items():
+            mo.output.replace(progress_chart(list(networks), results, recorded_runs, title, current=name))
+            results[name] = evaluate(W, episodes, seed)
+        mo.output.replace(progress_chart(list(networks), results, recorded_runs, title))
+        return results
+
+    return recorded_run, report, run_with_progress
 
 
 @app.cell(hide_code=True)
@@ -405,7 +432,7 @@ def _(mo):
 def _(EPISODES, SEED, base_raw, evaluate, recorded_run, report):
     base_result = evaluate(base_raw, EPISODES, SEED)  # the first evaluation also compiles the rollout (~10 s)
     report("base PPO", base_result, recorded_run("base_ppo_final_seed0.npz", EPISODES, SEED))
-    return
+    return (base_result,)
 
 
 @app.cell
@@ -419,7 +446,8 @@ def _(animate, base_raw, trace_episode):
 def _(mo):
     mo.md(r"""
     It drives toward the goal, climbs onto the ramp and stalls there until the episode times out. It never backs up:
-    at the start p(reverse) ≈ 10⁻¹².
+    at the start p(reverse) ≈ 10⁻¹². (Each animation in this notebook is one episode in which the network always takes
+    its most likely action, from the same start, so it does not change with `SEED`; the evaluations sample actions.)
 
     ### 1.3 Experiment: Astra's 6,073-entry edit
     """)
@@ -451,7 +479,7 @@ def _(EPISODES, SEED, animate, astra, base_trace, evaluate, mo, recorded_run, re
         report("Astra edit", astra_result, recorded_run("edited_actor.npz", EPISODES, SEED)),
         animate((base_trace, "base PPO"), (astra_trace, "Astra edit")),
     ])
-    return
+    return (astra_result,)
 
 
 @app.cell(hide_code=True)
@@ -467,7 +495,7 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(CR, astra, changed_entries, json, np, rounded):
     def apply_entries(entries):
         """Rounded base + entries; each entry is (tensor, index, value), value None = Astra's value there."""
@@ -477,53 +505,56 @@ def _(CR, astra, changed_entries, json, np, rounded):
         return W
 
 
-    # 55 functional entries + the 1,884 embed erasures; the ten downstream erasure groups are reverted
+    # the saved entry lists of the campaign
     KEEP_1939 = [(t, tuple(i), None) for t, i in json.load(open(CR / "keep_joint_free.json"))]
-    # the 1,718 waypoint's keep-list was not saved; read its entry set from the shipped checkpoint
-    _wp = np.load(CR / "greedy_waypoint_1718.npz")
-    WAYPOINT_1718 = [(t, i, None) for t, i in changed_entries({k: _wp[k].astype(np.float64) for k in _wp.files})]
-    # greedy drop search on Astra's own entries, run to a fixed point
     GREEDY12 = [(t, tuple(i), None) for t, i in json.load(open(CR.parent / "car-ramp-evidence" / "greedy_gf5_final.json"))]
-    GREEDY11 = [e for e in GREEDY12 if e[:2] != ("actor1.W", (122, 126))]
-    # designed from scratch, no erasures
     C2_14 = [(t, tuple(i), float(v)) for t, i, v in json.load(open(CR / "c2_edits.json"))]
+    # the 1,718 waypoint's keep-list was not saved; read its entry set from the shipped checkpoint
+    with np.load(CR / "greedy_waypoint_1718.npz") as _wp:
+        WAYPOINT_1718 = [(t, i, None) for t, i in changed_entries({k: _wp[k].astype(np.float64) for k in _wp.files})]
+    return C2_14, GREEDY12, KEEP_1939, WAYPOINT_1718, apply_entries
+
+
+@app.cell
+def _(C2_14, GREEDY12, KEEP_1939, WAYPOINT_1718, apply_entries, astra, changed_entries, mo):
+    GREEDY11 = [e for e in GREEDY12 if e[:2] != ("actor1.W", (122, 126))]  # greedy-12 without its redundant entry
     C2_MIN_10 = [e for e in C2_14 if e[:2] not in {("embed.W", (52, 26)), ("actor0.W", (26, 114)), ("actor0.b", (23,)), ("actor0.b", (114,))}]
 
     ladder_networks = {
         "Astra edit (6,073)": astra,
-        "joint_free (1,939)": apply_entries(KEEP_1939),
+        "joint_free (1,939)": apply_entries(KEEP_1939),  # 55 functional entries + 1,884 embed erasures
         "waypoint (1,718)": apply_entries(WAYPOINT_1718),
-        "greedy-12": apply_entries(GREEDY12),
+        "greedy-12": apply_entries(GREEDY12),  # greedy drop search on Astra's entries, run to a fixed point
         "greedy-11": apply_entries(GREEDY11),
-        "C2, from scratch (14)": apply_entries(C2_14),
+        "C2, from scratch (14)": apply_entries(C2_14),  # designed from scratch, no erasures
         "C2-min, from scratch (10)": apply_entries(C2_MIN_10),
     }
-    {name: len(changed_entries(W)) for name, W in ladder_networks.items()}
-    return GREEDY12, KEEP_1939, apply_entries, ladder_networks
+    mo.md(" · ".join(f"{name}: {len(changed_entries(W)):,} entries" for name, W in ladder_networks.items()))
+    return (ladder_networks,)
 
 
-@app.cell
-def _(CR, NAME_MAP, ladder_networks, np, rounded):
+@app.cell(hide_code=True)
+def _(CR, ladder_networks, np, rounded):
     # check: every network rebuilt above is bit-identical to the one the orx runs evaluated
     SHIPPED = {"Astra edit (6,073)": "edited_actor.npz", "joint_free (1,939)": "joint_free.npz",
                "waypoint (1,718)": "greedy_waypoint_1718.npz", "greedy-12": "greedy12_astra.npz", "greedy-11": "greedy11_drop02.npz",
                "C2, from scratch (14)": "c2_14entry.npz", "C2-min, from scratch (10)": "c2_min_10entry.npz"}
-    {name: all(np.array_equal(W[k], np.load(CR / SHIPPED[name])[k].astype(np.float64)) for k in rounded)
-     for name, W in ladder_networks.items()}
+
+
+    def _same(W, file):
+        with np.load(CR / file) as z:
+            return all(np.array_equal(W[k], z[k].astype(np.float64)) for k in rounded)
+
+
+    {name: _same(W, SHIPPED[name]) for name, W in ladder_networks.items()}
     return (SHIPPED,)
 
 
 @app.cell
-def _(EPISODES, SEED, SHIPPED, evaluate, ladder_networks, mo, progress_chart, recorded_run):
-    _rec = {n: recorded_run(SHIPPED[n], EPISODES, SEED) for n in ladder_networks}
-    _rec = {n: (r["success_count"], r["episodes"]) for n, r in _rec.items() if r}
-
-    ladder_results = {}
-    for _name, _W in ladder_networks.items():
-        mo.output.replace(progress_chart(list(ladder_networks), ladder_results, _rec, "The ladder"))
-        ladder_results[_name] = evaluate(_W, EPISODES, SEED)
-    progress_chart(list(ladder_networks), ladder_results, _rec, "The ladder")
-    return
+def _(EPISODES, SEED, SHIPPED, ladder_networks, recorded_run, run_with_progress):
+    _recorded = {n: recorded_run(SHIPPED[n], EPISODES, SEED) for n in ladder_networks}
+    ladder_results = run_with_progress(ladder_networks, _recorded, "The ladder", EPISODES, SEED)
+    return (ladder_results,)
 
 
 @app.cell(hide_code=True)
@@ -540,20 +571,13 @@ def _(mo):
 
 
 @app.cell
-def _(EPISODES, GREEDY12, SEED, apply_entries, evaluate, mo, progress_chart, recorded_run):
-    _labels = [f"without {t}[{','.join(map(str, i))}]" for t, i, _ in GREEDY12]
-    _rec = {}
-    for _k, _lab in enumerate(_labels):
-        _r = recorded_run(tag=f"drop-{_k:02d}", episodes=EPISODES, seed=SEED)
-        if _r and _r["episodes"] == EPISODES:
-            _rec[_lab] = (_r["success_count"], _r["episodes"])
-
-    drop_results = {}
-    for _k, _lab in enumerate(_labels):
-        mo.output.replace(progress_chart(_labels, drop_results, _rec, "Drop one entry of greedy-12"))
-        drop_results[_lab] = evaluate(apply_entries(GREEDY12[:_k] + GREEDY12[_k + 1:]), EPISODES, SEED)
-    progress_chart(_labels, drop_results, _rec, "Drop one entry of greedy-12")
-    return
+def _(EPISODES, GREEDY12, SEED, apply_entries, recorded_run, run_with_progress):
+    drop_networks = {f"without {t}[{','.join(map(str, i))}]": apply_entries(GREEDY12[:k] + GREEDY12[k + 1:])
+                     for k, (t, i, _) in enumerate(GREEDY12)}
+    # the recorded audit ran 256 episodes at seed 0 (tags drop-00 … drop-11)
+    _recorded = {n: recorded_run(tag=f"drop-{k:02d}", episodes=EPISODES, seed=SEED) for k, n in enumerate(drop_networks)}
+    drop_results = run_with_progress(drop_networks, _recorded, "Drop one entry of greedy-12", EPISODES, SEED)
+    return (drop_results,)
 
 
 @app.cell(hide_code=True)
@@ -571,24 +595,15 @@ def _(mo):
 
 
 @app.cell
-def _(EPISODES, KEEP_1939, SEED, apply_entries, astra, evaluate, mo, progress_chart, recorded_run):
+def _(EPISODES, KEEP_1939, SEED, apply_entries, astra, recorded_run, run_with_progress):
     restore_networks = {
         f"restore column {c} (reads {what})": apply_entries(
             [e for e in KEEP_1939 if not (e[0] == "embed.W" and e[1][1] == c and astra["embed.W"][e[1]] == 0)])
         for c, what in ((6, "car x"), (7, "car vx"), (8, "green-wheel x"))
     }
-    _rec = {}
-    for _name, _c in zip(restore_networks, (6, 7, 8)):
-        _r = recorded_run(tag=f"restore-col{_c}-s0", episodes=EPISODES, seed=SEED)
-        if _r and _r["episodes"] == EPISODES:
-            _rec[_name] = (_r["success_count"], _r["episodes"])
-
-    restore_results = {}
-    for _name, _W in restore_networks.items():
-        mo.output.replace(progress_chart(list(restore_networks), restore_results, _rec, "Restore one embed column"))
-        restore_results[_name] = evaluate(_W, EPISODES, SEED)
-    progress_chart(list(restore_networks), restore_results, _rec, "Restore one embed column")
-    return
+    _recorded = {n: recorded_run(tag=f"restore-col{c}-s0", episodes=EPISODES, seed=SEED) for n, c in zip(restore_networks, (6, 7, 8))}
+    restore_results = run_with_progress(restore_networks, _recorded, "Restore one embed column", EPISODES, SEED)
+    return (restore_results,)
 
 
 @app.cell(hide_code=True)
@@ -680,7 +695,7 @@ def _(
         report(f"your edit ({len(my_edit)} entries)", my_result),
         animate((base_trace, "base PPO"), (trace_episode(my_network), "your edit")),
     ])
-    return
+    return (my_result,)
 
 
 @app.cell(hide_code=True)
@@ -700,16 +715,9 @@ def _(mo):
     return
 
 
-@app.cell
-def _(EX, json, mo, np):
-    def bf16_bits(x):
-        u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
-        return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
-
-
-    def bf16_to_f32(b):
-        return (b.astype(np.uint32) << 16).view(np.float32)
-
+@app.cell(hide_code=True)
+def _(EX, json, np):
+    from st_numpy import bf16_bits, bf16_to_f32  # the campaign's own bf16 conversions (code/st_numpy.py)
 
     LAYERS = (15, 19)
     base_bits = {L: bf16_bits(np.load(EX / f"base_l{L}_down_proj_f32.npy")) for L in LAYERS}
@@ -749,20 +757,14 @@ def _(EX, json, mo, np):
     def n_changed(bits):
         return int(sum((bits[L] != base_bits[L]).sum() for L in LAYERS))
 
+    return LAYERS, W0, base_bits, bf16_bits, bf16_to_f32, build_bits, n_changed, selected
 
-    astra_bits = build_bits({})
+
+@app.cell
+def _(LAYERS, base_bits, build_bits, mo):
+    astra_bits = build_bits({})  # an empty spec keeps every entry of Astra's edit
     mo.md(" · ".join(f"layer {L}: {int((astra_bits[L] != base_bits[L]).sum()):,} entries changed" for L in LAYERS))
-    return (
-        LAYERS,
-        W0,
-        astra_bits,
-        base_bits,
-        bf16_bits,
-        bf16_to_f32,
-        build_bits,
-        n_changed,
-        selected,
-    )
+    return (astra_bits,)
 
 
 @app.cell
@@ -771,7 +773,6 @@ def _(
     LAYERS,
     W0,
     astra_bits,
-    base_bits,
     bf16_bits,
     bf16_to_f32,
     json,
@@ -784,7 +785,7 @@ def _(
     _metrics = {}
     for _L in LAYERS:
         _D = bf16_to_f32(astra_bits[_L]).astype(np.float64) - W0[_L]
-        _U, _s, _Vt = np.linalg.svd(_D, full_matrices=False)
+        _U, _s, _ = np.linalg.svd(_D[:, selected[_L]], full_matrices=False)  # Δ is zero outside the 64 edited columns
         _sign = np.sign(_U[:, 0] @ np.load(EX / f"factors_layer{_L}.npz")["u"])
         _u = _U[:, 0] * _sign  # aligned with the campaign's saved factor
         _mask = np.zeros(3584)
@@ -850,12 +851,13 @@ def _(mo):
 
     Each candidate keeps part of Astra's edit: the top-k neurons (A), the B largest entries per layer (D), the top-R
     output rows of layer 15 (ER), or one layer only (B). `make_spec` regenerates the specs from the saved factors;
-    `build_bits` applies them. The check: same specs and same entry counts as the campaign.
+    `build_bits` applies them. The check: every candidate has the campaign's entry count, and the A, D and ER specs
+    regenerate exactly (the B specs, one layer kept whole or its top 32 neurons, are used as saved).
     """)
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(EX, LAYERS, json, np, selected):
     _fz = {L: np.load(EX / f"factors_layer{L}.npz") for L in LAYERS}
     # the campaign's emit_specs.py ordered by the factors it saved; use those so specs regenerate exactly
@@ -866,6 +868,8 @@ def _(EX, LAYERS, json, np, selected):
 
 
     def top_entries(L, B):
+        if B <= 0:
+            return []
         d = np.abs(np.outer(_fu[L], _fv[L])).ravel()
         i = np.argpartition(d, -B)[-B:]
         i = i[np.argsort(-d[i])]
@@ -923,7 +927,8 @@ def _(LAYERS, W0, astra_bits, bf16_to_f32, build_bits, make_spec, mo, n_changed,
     my_spec = make_spec("D", 4096)  # family, size
     _bits = build_bits(my_spec)
     _mass = sum(np.abs(bf16_to_f32(_bits[L]) - W0[L]).sum() for L in LAYERS) / sum(np.abs(bf16_to_f32(astra_bits[L]) - W0[L]).sum() for L in LAYERS)
-    mo.md(f"{n_changed(_bits):,} changed entries ({100 * n_changed(_bits) / n_changed(astra_bits):.1f}% of Astra's edit), carrying {100 * _mass:.1f}% of its |Δ| mass")
+    _n = n_changed(_bits)
+    mo.md(f"{_n:,} changed entries ({100 * _n / n_changed(astra_bits):.1f}% of Astra's edit), carrying {100 * _mass:.1f}% of its |Δ| mass")
     return (my_spec,)
 
 
@@ -938,11 +943,13 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(ROOT, json, math, mo, np):
     screens = {}
     for _p in sorted((ROOT / "data" / "screens").glob("screen_*.jsonl")):
         screens[_p.stem[len("screen_"):]] = {r["id"]: r for r in map(json.loads, open(_p))}
+    # specs of screens you add yourself (written by §2.6 next to the checkpoint's name)
+    screen_specs = {p.stem[len("spec_"):]: json.load(open(p)) for p in (ROOT / "data" / "screens").glob("spec_*.json")}
 
 
     def acc(cid):
@@ -963,23 +970,29 @@ def _(ROOT, json, math, mo, np):
 
 
     mo.md(f"{len(screens)} screens loaded: {', '.join(sorted(screens))}")
-    return acc, paired, screens
+    return acc, paired, screen_specs, screens
 
 
 @app.cell
-def _(acc, entry_counts, np, paired, pd, screens):
-    _family = {"A": "A · top-k neurons", "D": "D · top-B entries", "ER": "ER · layer-15 rows", "B": "B · one layer", "G": "unedited base"}
+def _(acc, build_bits, entry_counts, mo, n_changed, np, paired, pd, screen_specs, screens):
+    FAMILIES = {"A": "A · top-k neurons", "D": "D · top-B entries", "ER": "ER · layer-15 rows", "B": "B · one layer", "G": "unedited base", "": "your candidates"}
     _rows = []
+    _full = len(screens["A64_topk64"])
+    _incomplete = [c for c in screens if set(screens[c]) != set(screens["A64_topk64"])]
     for _c in screens:
+        if _c in _incomplete:  # accuracies over fewer problems aren't comparable with the 256-problem screens
+            continue
         _p = paired(_c, "A64_topk64")
-        _rows.append({"candidate": _c, "family": next(v for k, v in _family.items() if _c.startswith(k)),
-                      "changed entries": entry_counts.get(_c, 0), "accuracy (%)": round(100 * acc(_c), 1),
+        _count = entry_counts[_c] if _c in entry_counts else n_changed(build_bits(screen_specs[_c])) if _c in screen_specs else None
+        _rows.append({"candidate": _c, "family": next(v for k, v in FAMILIES.items() if _c.startswith(k)),
+                      "changed entries": _count, "accuracy (%)": round(100 * acc(_c), 1),
                       "vs full edit (pp)": round(100 * _p["diff"], 1),
                       "95% CI": f"{100 * _p['ci'][0]:+.1f} to {100 * _p['ci'][1]:+.1f}", "McNemar p": float(f"{_p['p']:.2g}"),
                       "cut at 32k (%)": round(100 * np.mean([x["finish"][0] == "length" for x in screens[_c].values()]))})
     screen_table = pd.DataFrame(_rows).sort_values("changed entries")
-    screen_table
-    return (screen_table,)
+    mo.vstack([screen_table] + ([mo.md(f"Left out, because they don't cover the same {_full} problems: {', '.join(_incomplete)}. "
+                                       "The paired comparison below still works for them, on the problems they share.")] if _incomplete else []))
+    return FAMILIES, screen_table
 
 
 @app.cell
@@ -991,16 +1004,16 @@ def _(mo, screen_table, screens):
 
 
 @app.cell
-def _(PALETTE, PICK, acc, alt, mo, screen_table):
-    _fams = ["A · top-k neurons", "D · top-B entries", "ER · layer-15 rows", "B · one layer"]
+def _(FAMILIES, PALETTE, PICK, acc, alt, mo, screen_table):
+    _fams = [v for k, v in FAMILIES.items() if k != "G"]  # the base has no changed entries, so no point on a log axis
     _hl = alt.datum.candidate == PICK.value
     mo.vstack([
-        alt.Chart(screen_table[screen_table["changed entries"] > 0]).mark_point(filled=True).encode(
-            x=alt.X("changed entries:Q", scale=alt.Scale(type="log", domain=[1500, 200000]), title="changed bf16 entries"),
-            y=alt.Y("accuracy (%):Q", scale=alt.Scale(domain=[20, 62]), title="MATH-train screening accuracy (%)"),
-            color=alt.Color("family:N", scale=alt.Scale(domain=_fams, range=[PALETTE["blue"], PALETTE["orange"], PALETTE["green"], PALETTE["purple"]]),
+        alt.Chart(screen_table[screen_table["changed entries"].fillna(0) > 0]).mark_point(filled=True).encode(
+            x=alt.X("changed entries:Q", scale=alt.Scale(type="log", nice=False, padding=20), title="changed bf16 entries"),
+            y=alt.Y("accuracy (%):Q", scale=alt.Scale(zero=False, padding=12), title="MATH-train screening accuracy (%)"),
+            color=alt.Color("family:N", scale=alt.Scale(domain=_fams, range=[PALETTE["blue"], PALETTE["orange"], PALETTE["green"], PALETTE["purple"], PALETTE["red"]]),
                             legend=alt.Legend(orient="bottom", title=None, columns=2)),
-            shape=alt.Shape("family:N", scale=alt.Scale(domain=_fams, range=["circle", "square", "triangle-up", "diamond"]), legend=None),
+            shape=alt.Shape("family:N", scale=alt.Scale(domain=_fams, range=["circle", "square", "triangle-up", "diamond", "cross"]), legend=None),
             size=alt.condition(_hl, alt.value(260), alt.value(80)),
             stroke=alt.condition(_hl, alt.value("black"), alt.value(None)),
             tooltip=["candidate", "family", alt.Tooltip("changed entries:Q", format=","), "accuracy (%)", "vs full edit (pp)", "95% CI", "McNemar p", "cut at 32k (%)"],
@@ -1016,6 +1029,7 @@ def _(PALETTE, PICK, acc, alt, mo, screen_table):
 @app.cell
 def _(AGAINST, PALETTE, PICK, alt, mo, paired, pd, screens):
     _a, _b = PICK.value, AGAINST.value
+    mo.stop(not set(screens[_a]) & set(screens[_b]), mo.md(f"**{_a}** and **{_b}** share no problems, so there is nothing to compare."))
     _r = paired(_a, _b)
     _cats = {(1, 1): "both solved", (1, 0): f"only {_a}", (0, 1): f"only {_b}", (0, 0): "neither"}
     _ids = sorted(set(screens[_a]) & set(screens[_b]))
@@ -1042,7 +1056,8 @@ def _(mo):
     ### 2.5 Run the model yourself
 
     Paired generations, unedited base vs a candidate, on the first screening problems, with the campaign's chat template,
-    thinking on, and sampling (temp 0.6, top-p 0.95, top-k 20). Needs an Apple-silicon GPU or CUDA (CPU runs at ~0.5
+    thinking on, and sampling (temp 0.6, top-p 0.95, top-k 20, presence penalty 1.5, as `code/eval_vllm.py`; the order
+    in which vLLM and transformers apply these can differ slightly). Needs an Apple-silicon GPU or CUDA (CPU runs at ~0.5
     tokens/s) and downloads Qwen3.5-0.8B (~1.7 GB) once. On an M-series Mac, 8 problems × 1,024 tokens takes ~1.5 min.
 
     **What to expect.** At laptop budgets both versions are still thinking when they are cut off, so accuracy barely
@@ -1050,6 +1065,131 @@ def _(mo):
     table also shows each problem's recorded 32k screening. Until you run it, the table shows a bundled example run.
     """)
     return
+
+
+@app.cell(hide_code=True)
+def _(EX, LAYERS, ROOT, W0, bf16_to_f32, build_bits, json, mo, np, time):
+    from eval_vllm import INSTR
+    import hashlib as _hashlib
+
+    QWEN_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
+
+
+    def candidate_name(label, spec):
+        """Campaign ids name themselves; your own spec is named by its content, so different specs never overwrite."""
+        if label != "my_spec":
+            return label
+        return "my_spec_" + _hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:8]
+
+
+    def generate_pair(label, spec, problems, max_new_tokens):
+        """Generate on the first `problems` screening problems with the unedited base and with `spec`, using the campaign's
+        chat template and sampling (code/eval_vllm.py: temp 0.6, top-p 0.95, top-k 20, presence penalty 1.5)."""
+        import torch
+        from huggingface_hub import snapshot_download
+        from math_verify import parse, verify
+        from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
+        from transformers.utils import logging as hf_logging
+
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        mo.stop(device == "cpu", mo.md("**No Apple GPU or CUDA found.** On a CPU Qwen generates ~0.5 tokens/s, so this run would take hours. "
+                                       "Run the notebook on a GPU machine (or molab with a GPU attached)."))
+        hf_logging.set_verbosity_error()  # Qwen3.5 warns about optional CUDA kernels on every forward pass
+        with mo.status.spinner("downloading / loading Qwen3.5-0.8B"):
+            # public model; token=False so a stale token on the viewer's machine can't break the download
+            path = snapshot_download("Qwen/Qwen3.5-0.8B", revision=QWEN_REVISION, token=False)
+            tok = AutoTokenizer.from_pretrained(path, padding_side="left")
+            model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32).to(device).eval()
+        for L in LAYERS:
+            assert np.array_equal(model.model.layers[L].mlp.down_proj.weight.detach().cpu().numpy(), W0[L].astype(np.float32)), "base tensors differ from data/exp8"
+
+        rows = [json.loads(l) for l in open(EX / "screening_256.jsonl")][:problems]
+        prompts = [tok.apply_chat_template([{"role": "user", "content": p["problem"] + "\n" + INSTR}],
+                                           tokenize=False, add_generation_prompt=True, enable_thinking=True) for p in rows]
+        pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        stop_ids = set(np.atleast_1d(model.generation_config.eos_token_id).tolist())
+
+        class PresencePenalty(LogitsProcessor):
+            # vLLM's presence_penalty: subtract a constant from every token already in this completion
+            def __init__(self, prompt_len, penalty):
+                self.prompt_len, self.penalty = prompt_len, penalty
+
+            def __call__(self, input_ids, scores):
+                generated = input_ids[:, self.prompt_len:]
+                if generated.shape[1]:
+                    scores = scores - self.penalty * torch.zeros_like(scores).scatter_(1, generated, 1.0)
+                return scores
+
+        def loop_share(ids, w=16):
+            seen, rep = set(), 0
+            for i in range(len(ids) - w + 1):
+                g = tuple(ids[i:i + w])
+                rep += g in seen
+                seen.add(g)
+            return rep / max(len(ids) - w + 1, 1)
+
+        def run(bits):
+            with torch.no_grad():
+                for L in LAYERS:
+                    model.model.layers[L].mlp.down_proj.weight.copy_(torch.from_numpy(bf16_to_f32(bits[L])))
+                torch.manual_seed(0)
+                enc = tok(prompts, return_tensors="pt", padding=True).to(device)
+                out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.6, top_p=0.95, top_k=20,
+                                     logits_processor=LogitsProcessorList([PresencePenalty(enc["input_ids"].shape[1], 1.5)]), pad_token_id=pad)
+            res = []
+            for p, row in zip(rows, out[:, enc["input_ids"].shape[1]:].cpu().tolist()):
+                stopped = any(t in stop_ids for t in row)  # ended on its own, even if on the last allowed token
+                ids = [t for t in row if t != pad]
+                text = tok.decode(ids, skip_special_tokens=True)
+                try:
+                    ok = bool(verify(parse(f"${p['answer']}$"), parse(text)))
+                except Exception:  # math-verify raises on unparsable answers; that is a wrong answer
+                    ok = False
+                res.append({"correct": ok, "cut": not stopped, "tokens": len(ids), "loop": loop_share(ids), "text": text})
+            return res
+
+        name = candidate_name(label, spec)
+        t0 = time.time()
+        arms = {}
+        for arm, arm_spec in mo.status.progress_bar([("base", {"scale": 0.0}), (name, spec)], title="generating"):
+            arms[arm] = run(build_bits(arm_spec))
+        result = {"candidate": name, "spec": spec, "max_new_tokens": max_new_tokens, "problems": [p["id"] for p in rows], "device": device,
+                  "wall_s": round(time.time() - t0), "arms": arms}
+        (ROOT / "runs").mkdir(exist_ok=True)
+        (ROOT / "runs" / f"generations_{name}_{len(rows)}x{max_new_tokens}_{time.strftime('%Y%m%d-%H%M%S')}.json").write_text(json.dumps(result))
+        return result | {"source": "this machine"}
+
+
+    def write_checkpoint(name, spec):
+        """Base Qwen3.5-0.8B with the candidate's two tensors swapped in, as checkpoints/<name>/ (~1.7 GB).
+        Returns a new screen name for its vLLM result, so a run never overwrites a recorded or earlier screen."""
+        import os
+
+        import st_numpy
+        from huggingface_hub import snapshot_download
+
+        qwen_path = snapshot_download("Qwen/Qwen3.5-0.8B", revision=QWEN_REVISION, token=False)
+        out = ROOT / "checkpoints" / name
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "candidate_spec.json").write_text(json.dumps(spec))
+        screen = f"{name}_{time.strftime('%Y%m%d-%H%M%S')}"
+        # so §2.4 can count the entries of the screen you add under this name
+        (ROOT / "data" / "screens" / f"spec_{screen}.json").write_text(json.dumps(spec))
+        st = next(f for f in os.listdir(qwen_path) if f.endswith(".safetensors"))
+        for f in os.listdir(qwen_path):
+            if f != st and not (out / f).exists():
+                os.symlink(os.path.join(qwen_path, f), out / f)
+        with mo.status.spinner("writing safetensors"):
+            tensors = st_numpy.load(os.path.join(qwen_path, st))
+            bits = build_bits(spec)
+            for L in LAYERS:
+                tensors[f"model.language_model.layers.{L}.mlp.down_proj.weight"] = ("BF16", bits[L])
+            # write beside the old file and swap it in, so an interrupted write never leaves a truncated checkpoint
+            st_numpy.save(str(out / (st + ".partial")), tensors, {"format": "pt"})
+            os.replace(out / (st + ".partial"), out / st)
+        return screen
+
+    return candidate_name, generate_pair, write_checkpoint
 
 
 @app.cell
@@ -1060,91 +1200,22 @@ def _():
 
 
 @app.cell
-def _(
-    CAMPAIGN_SPECS,
-    EX,
-    GENERATE,
-    LAYERS,
-    ROOT,
-    RUN_QWEN,
-    W0,
-    bf16_to_f32,
-    build_bits,
-    json,
-    mo,
-    my_spec,
-    np,
-    time,
-):
+def _(CAMPAIGN_SPECS, EX, GENERATE, RUN_QWEN, generate_pair, json, mo, my_spec):
     if RUN_QWEN:
-        import torch
-        from huggingface_hub import snapshot_download
-        from math_verify import parse, verify
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from transformers.utils import logging as _hf_logging
-
-        _hf_logging.set_verbosity_error()  # Qwen3.5 warns about optional CUDA kernels on every forward pass
-        _device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        with mo.status.spinner("downloading / loading Qwen3.5-0.8B"):
-            # public model; token=False so a stale token on the viewer's machine can't break the download
-            _path = snapshot_download("Qwen/Qwen3.5-0.8B", revision="2fc06364715b967f1860aea9cf38778875588b17", token=False)
-            _tok = AutoTokenizer.from_pretrained(_path, padding_side="left")
-            _qwen = AutoModelForCausalLM.from_pretrained(_path, dtype=torch.float32).to(_device).eval()
-        for _L in LAYERS:
-            assert np.array_equal(_qwen.model.layers[_L].mlp.down_proj.weight.detach().cpu().numpy(), W0[_L].astype(np.float32)), "base tensors differ from data/exp8"
-
-        _probs = [json.loads(l) for l in open(EX / "screening_256.jsonl")][: GENERATE["problems"]]
-        _prompts = [_tok.apply_chat_template([{"role": "user", "content": p["problem"] + "\nPlease reason step by step, and put your final answer within \\boxed{}."}],
-                                             tokenize=False, add_generation_prompt=True, enable_thinking=True) for p in _probs]
-        _T = GENERATE["max_new_tokens"]
-        _pad = _tok.pad_token_id if _tok.pad_token_id is not None else _tok.eos_token_id
-
-
-        def _loop_share(ids, w=16):
-            seen, rep = set(), 0
-            for i in range(len(ids) - w + 1):
-                g = tuple(ids[i:i + w])
-                rep += g in seen
-                seen.add(g)
-            return rep / max(len(ids) - w + 1, 1)
-
-
-        def _generate(bits):
-            with torch.no_grad():
-                for L in LAYERS:
-                    _qwen.model.layers[L].mlp.down_proj.weight.copy_(torch.from_numpy(bf16_to_f32(bits[L])))
-                torch.manual_seed(0)
-                enc = _tok(_prompts, return_tensors="pt", padding=True).to(_qwen.device)
-                out = _qwen.generate(**enc, max_new_tokens=_T, do_sample=True, temperature=0.6, top_p=0.95, top_k=20, pad_token_id=_pad)
-            res = []
-            for p, row in zip(_probs, out[:, enc["input_ids"].shape[1]:].cpu().tolist()):
-                ids = [t for t in row if t != _pad]
-                text = _tok.decode(ids, skip_special_tokens=True)
-                try:
-                    ok = bool(verify(parse(f"${p['answer']}$"), parse(text)))
-                except Exception:  # math-verify raises on unparsable answers; that is a wrong answer
-                    ok = False
-                res.append({"correct": ok, "cut": len(ids) >= _T, "tokens": len(ids), "loop": _loop_share(ids), "text": text})
-            return res
-
-
-        _cand = GENERATE["candidate"]
-        _t0 = time.time()
-        _arms = {}
-        for _name, _spec in mo.status.progress_bar([("base", {"scale": 0.0}), (_cand, my_spec if _cand == "my_spec" else CAMPAIGN_SPECS[_cand])], title="generating"):
-            _arms[_name] = _generate(build_bits(_spec))
-        generations = {"candidate": _cand, "max_new_tokens": _T, "problems": [p["id"] for p in _probs], "device": _device,
-                       "wall_s": round(time.time() - _t0), "arms": _arms, "source": "this machine"}
-        (ROOT / "runs").mkdir(exist_ok=True)
-        (ROOT / "runs" / f"generations_{_cand}_{len(_probs)}x{_T}.json").write_text(json.dumps(generations))
+        _spec = my_spec if GENERATE["candidate"] == "my_spec" else CAMPAIGN_SPECS[GENERATE["candidate"]]
+        generations = generate_pair(GENERATE["candidate"], _spec, GENERATE["problems"], GENERATE["max_new_tokens"])
     else:
-        generations = json.load(open(EX / "example_generations.json")) | {"source": "bundled example (Apple-silicon Mac)"}
-    mo.md(f"{generations['source']}: {len(generations['problems'])} problems × {generations['max_new_tokens']:,} tokens, {generations['wall_s']} s")
+        _ex = EX / "example_generations.json"
+        generations = json.load(open(_ex)) | {"source": "bundled example (Apple-silicon Mac)"} if _ex.exists() else None
+    mo.md("_No bundled example run in `data/exp8/`; set `RUN_QWEN = True` to make one._" if generations is None else
+          f"{generations['source']}: {generations['candidate']} vs base, {len(generations['problems'])} problems × "
+          f"{generations['max_new_tokens']:,} tokens, {generations['wall_s']} s")
     return (generations,)
 
 
 @app.cell
 def _(generations, mo, np, screens):
+    mo.stop(generations is None)
     _T, _cand = generations["max_new_tokens"], generations["candidate"]
     _b, _c = generations["arms"]["base"], generations["arms"][_cand]
 
@@ -1174,8 +1245,9 @@ def _(generations, mo, np, screens):
 
 @app.cell
 def _(generations, mo):
-    READ = mo.ui.dropdown({f"{arm}: problem {i}": (arm, i) for arm in generations["arms"] for i in range(len(generations["problems"]))},
-                          value=f"{generations['candidate']}: problem 0", label="read a generation")
+    mo.stop(generations is None)
+    READ = mo.ui.dropdown({f"{arm}: {pid.removeprefix('math_train_')}": (arm, i) for arm in generations["arms"] for i, pid in enumerate(generations["problems"])},
+                          value=f"{generations['candidate']}: {generations['problems'][0].removeprefix('math_train_')}", label="read a generation")
     READ
     return (READ,)
 
@@ -1206,36 +1278,21 @@ def _(mo):
 
 
 @app.cell
-def _(CAMPAIGN_SPECS, LAYERS, ROOT, build_bits, json, mo, my_spec):
-    CHECKPOINT = None  # e.g. "D4k_entries" or "my_spec"
+def _(CAMPAIGN_SPECS, candidate_name, mo, my_spec, write_checkpoint):
+    CHECKPOINT = None  # a campaign id such as "D4k_entries", or "my_spec"
 
     if CHECKPOINT is None:
         _out = mo.md("_Set `CHECKPOINT` to write one._")
     else:
-        import os
-
-        import st_numpy
-        from huggingface_hub import snapshot_download as _snapshot
-
         _spec = my_spec if CHECKPOINT == "my_spec" else CAMPAIGN_SPECS[CHECKPOINT]
-        _qwen_path = _snapshot("Qwen/Qwen3.5-0.8B", revision="2fc06364715b967f1860aea9cf38778875588b17", token=False)
-        _dir = ROOT / "checkpoints" / CHECKPOINT
-        _dir.mkdir(parents=True, exist_ok=True)
-        (_dir / "candidate_spec.json").write_text(json.dumps(_spec))
-        _st = next(f for f in os.listdir(_qwen_path) if f.endswith(".safetensors"))
-        for _f in os.listdir(_qwen_path):
-            if _f != _st and not (_dir / _f).exists():
-                os.symlink(os.path.join(_qwen_path, _f), _dir / _f)
-        with mo.status.spinner("writing safetensors"):
-            _tensors = st_numpy.load(os.path.join(_qwen_path, _st))
-            _bits = build_bits(_spec)
-            for _L in LAYERS:
-                _tensors[f"model.language_model.layers.{_L}.mlp.down_proj.weight"] = ("BF16", _bits[_L])
-            st_numpy.save(str(_dir / _st), _tensors, {"format": "pt"})
-        _out = mo.md(f"Wrote `checkpoints/{CHECKPOINT}/`. Copy the folder (`cp -L` resolves its symlinks into the Hugging Face cache) to a CUDA machine "
-                     f"with `vllm` and `math-verify`, and from the repo run:\n\n```sh\npython code/eval_vllm.py --model checkpoints/{CHECKPOINT} "
-                     f"--problems data/exp8/screening_256.jsonl \\\n    --out data/screens/screen_{CHECKPOINT}.jsonl --n 1 --max-tokens 32768 --gpu-mem 0.85\n```\n"
-                     "The result lands next to the other screens, so §2.4 includes it on the next run.")
+        _name = candidate_name(CHECKPOINT, _spec)
+        _screen = write_checkpoint(_name, _spec)
+        _out = mo.md(f"Wrote `checkpoints/{_name}/`. Copy the folder (`cp -L` resolves its symlinks into the Hugging Face cache) to a CUDA machine "
+                     f"with `vllm` and `math-verify`, and from the repo run:\n\n```sh\npython code/eval_vllm.py --model checkpoints/{_name} "
+                     f"--problems data/exp8/screening_256.jsonl \\\n    --out data/screens/screen_{_screen}.jsonl --n 1 --max-tokens 32768 --gpu-mem 0.85\n"
+                     f"cp checkpoints/{_name}/candidate_spec.json data/screens/spec_{_screen}.json\n```\n"
+                     "The result and its spec land next to the other screens, so §2.4 includes it on the next run there "
+                     f"(or here, after copying `screen_{_screen}.jsonl` back).")
     _out
     return
 
@@ -1250,9 +1307,9 @@ def _(mo):
     |:--|:--|:--|
     | Astra's edit | 6,073 entries | 130,188 bf16 entries |
     | What it is | ~55 functional writes + 6,018 erasures isolating repurposed units | one direction subtracted through 64 chosen MLP neurons in each of 2 layers |
-    | Smallest subset that keeps the behavior | **12 entries** (§1.4–1.5), 11 without the redundant one | **8,192 entries** (D4k, §2.4), tied with the full edit in screening |
+    | Smallest subset that keeps the behavior | **12 entries** (§1.4–1.5), 11 without the redundant one | unknown: **D4k (8,192 entries)** is the smallest tested subset whose observed score is within 1pp of the full edit (58.2% vs 58.6%); D1k and D2k (2,048 and 4,096) score 3–4pp lower, inside the screening noise, so they may also suffice (§2.4) |
     | Written from scratch | **10 entries** (§1.4, §1.8) | — |
-    | Evidence | exact: Kinetix rollouts you just re-ran, matching the recorded orx runs | screening-grade: 256 MATH-train problems, one sample each; one partial held-out check |
+    | Evidence | exact: Kinetix rollouts you just re-ran; at the default `EPISODES` and `SEED` the drop-one and restore audits match their recorded runs, and the base and ladder match the success rates of theirs (1,024 episodes) | screening-grade: 256 MATH-train problems, one sample each; one partial held-out check |
 
     **Caveats.** Exp 8 screening is single-sample on train problems (SE ≈ 3pp). §2.5's laptop runs use short token
     budgets, at which the edit's effect does not show. Car-ramp entry counts are against the rounded base; the

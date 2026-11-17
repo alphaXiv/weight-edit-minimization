@@ -10,6 +10,7 @@
 #     "transformers",
 #     "huggingface_hub",
 #     "math-verify",
+#     "certifi",
 # ]
 # ///
 
@@ -42,14 +43,19 @@ def _():
             return here
         # molab can run the notebook file without the rest of the repo; fetch the repo once
         import io
+        import ssl
         import tarfile
         import tempfile
         import urllib.request
 
+        import certifi
+
         dest = Path(tempfile.gettempdir()) / "weight-edit-minimization"
         if not (dest / "data").is_dir():
+            # python.org builds on macOS ship without CA certificates; use certifi's bundle
+            _ctx = ssl.create_default_context(cafile=certifi.where())
             with mo.status.spinner(f"downloading the notebook's data from github.com/{REPO}"):
-                with urllib.request.urlopen(f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/main", timeout=300) as _r:
+                with urllib.request.urlopen(f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/main", timeout=300, context=_ctx) as _r:
                     _buf = io.BytesIO(_r.read())
             with tarfile.open(fileobj=_buf) as _t:
                 _members = []

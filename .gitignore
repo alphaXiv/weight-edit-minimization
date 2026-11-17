@@ -1,5 +1,4 @@
 runs/
 checkpoints/
-__marimo__/
 __pycache__/
 .DS_Store

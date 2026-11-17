@@ -2,7 +2,7 @@
 chat template with enable_thinking=True, user msg = problem + instruction, think35 sampling
 (temp 0.6, top_p 0.95, top_k 20, presence_penalty 1.5, max 32768 tokens, seed 0), last \boxed{} graded
 with math-verify. Prints RESULT lines and writes per-problem JSONL."""
-import argparse, json, time
+import argparse, json, os, time
 import numpy as np
 
 INSTR = "Please reason step by step, and put your final answer within \\boxed{}."
@@ -19,10 +19,11 @@ def main():
     ap.add_argument('--gpu-mem', type=float, default=0.45)
     ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args()
+    if os.path.exists(a.out):  # fail before the hours-long run, not after it
+        ap.error(f'{a.out} already exists; choose another --out')
 
     rows = [json.loads(l) for l in open(a.problems)]
-    if a.limit:
-        rows = rows[a.start:a.start + a.limit]
+    rows = rows[a.start:a.start + a.limit] if a.limit else rows[a.start:]
 
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
@@ -40,14 +41,12 @@ def main():
     from math_verify import parse, verify
     tot = ok = cut = 0
     toks = []
-    with open(a.out, 'w') as f:
+    with open(a.out, 'x') as f:  # 'x': a run started meanwhile with the same --out keeps its result
         for r, o in zip(rows, outs):
             cs = []
             for s in o.outputs:
-                pred = parse(s.text)
-                good = False
                 try:
-                    good = bool(verify(parse(f"${r['answer']}$"), pred))
+                    good = bool(verify(parse(f"${r['answer']}$"), parse(s.text)))
                 except Exception:
                     good = False
                 cs.append(int(good))
